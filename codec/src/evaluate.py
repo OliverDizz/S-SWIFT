@@ -3,7 +3,6 @@ import os
 import time
 
 import numpy as np
-from scipy.misc import imread, imresize, imsave
 
 import torch
 from torch.autograd import Variable
@@ -15,7 +14,6 @@ from dataset import get_loader
 
 
 def save_codes(name, codes):
-  print(codes)
   codes = (codes.astype(np.int8) + 1) // 2
   export = np.packbits(codes.reshape(-1))
   np.savez_compressed(
@@ -75,13 +73,14 @@ def get_psnr(args, filenames, original, out_imgs):
   return all_psnr
 
 
-def run_eval(model, eval_loader, args, output_suffix=''):
+def run_eval(model, eval_loader, args, output_suffix='',
+             writer=None, global_step=0, tag_prefix='eval'):
 
   for sub_dir in ['codes', 'images']:
     cur_eval_dir = os.path.join(args.out_dir, output_suffix, sub_dir)
     if not os.path.exists(cur_eval_dir):
       print("Creating directory %s." % cur_eval_dir)
-      os.makedirs(cur_eval_dir)
+      os.makedirs(cur_eval_dir, exist_ok=True)
 
   all_losses, all_msssim, all_psnr = [], [], []
   all_psnr_ee1, all_psnr_ee2, all_psnr_ee3, all_psnr_ee4 = [], [], [], []
@@ -89,11 +88,34 @@ def run_eval(model, eval_loader, args, output_suffix=''):
   start_time = time.time()
   for i, (batch, ctx_frames, filenames) in enumerate(eval_loader):
 
-      with torch.no_grad():
-          batch = batch.cuda()
+      with torch.inference_mode():
+          batch = batch.cuda(non_blocking=True)
 
           original, out_imgs, out_imgs_ee1, out_imgs_ee2, out_imgs_ee3, out_imgs_ee4, losses, code_batch = eval_forward(
                   model, (batch, ctx_frames), args)
+
+          if writer is not None and i == 0:
+              writer.add_image(
+                  '%s/images/original' % tag_prefix,
+                  original[0], global_step, dataformats='CHW')
+              writer.add_image(
+                  '%s/images/recon_step_01' % tag_prefix,
+                  out_imgs[0][0], global_step, dataformats='CHW')
+              writer.add_image(
+                  '%s/images/recon_final' % tag_prefix,
+                  out_imgs[-1][0], global_step, dataformats='CHW')
+              writer.add_image(
+                  '%s/images/ee1_final' % tag_prefix,
+                  out_imgs_ee1[-1][0], global_step, dataformats='CHW')
+              writer.add_image(
+                  '%s/images/ee2_final' % tag_prefix,
+                  out_imgs_ee2[-1][0], global_step, dataformats='CHW')
+              writer.add_image(
+                  '%s/images/ee3_final' % tag_prefix,
+                  out_imgs_ee3[-1][0], global_step, dataformats='CHW')
+              writer.add_image(
+                  '%s/images/ee4_final' % tag_prefix,
+                  out_imgs_ee4[-1][0], global_step, dataformats='CHW')
 
           losses, msssim, psnr = finish_batch(
                   args, filenames, original, out_imgs,

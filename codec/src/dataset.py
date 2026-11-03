@@ -19,12 +19,37 @@ def get_loader(is_train, root, mv_dir, args):
         args=args,
     )
 
-    loader = data.DataLoader(
-        dataset=dset,
-        batch_size=args.batch_size if is_train else args.eval_batch_size,
-        shuffle=is_train,
-        num_workers=2
-    )
+    num_workers = getattr(args, 'num_workers', 2)
+    world_size = getattr(args, 'world_size', 1)
+    rank = getattr(args, 'rank', 0)
+    mp_context = getattr(args, 'mp_context', 'fork')
+
+    loader_kwargs = {
+        'dataset': dset,
+        'batch_size': args.batch_size if is_train else args.eval_batch_size,
+        'num_workers': num_workers,
+        'pin_memory': torch.cuda.is_available(),
+    }
+
+    if is_train and world_size > 1:
+        sampler = data.distributed.DistributedSampler(
+            dset, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True)
+        loader_kwargs['sampler'] = sampler
+        loader_kwargs['shuffle'] = False
+        loader_kwargs['drop_last'] = False
+    else:
+        loader_kwargs['shuffle'] = is_train
+        loader_kwargs['drop_last'] = is_train
+
+    if num_workers > 0:
+        loader_kwargs.update({
+            'persistent_workers': True,
+            'prefetch_factor': 2,
+            'multiprocessing_context': mp_context,
+        })
+
+    loader = data.DataLoader(**loader_kwargs)
 
     print('Loader for {} images ({} batches) created.'.format(
         len(dset), len(loader))
@@ -62,35 +87,19 @@ def read_bmv(fn):
 
 
 def get_bmv(img, fns):
-    before_x, before_y, after_x, after_y = fns
+    height, width = img.shape[:2]
+    bmvs = []
 
-    bmvs = [read_bmv(before_x),
-            read_bmv(before_y),
-            read_bmv(after_x),
-            read_bmv(after_y)]
-
-    if bmvs[0] is None or bmvs[1] is None:
-        if 'ultra_video_group' in before_x:
-            # We need HW to be (16n1, 16n2).
-            bmvs[0] = np.zeros((1072, 1920, 1))
-            bmvs[1] = np.zeros((1072, 1920, 1))
+    for fn in fns:
+        bmv = read_bmv(fn)
+        if bmv is None:
+            bmv = np.zeros((height, width, 1))
         else:
-            bmvs[0] = np.zeros((288, 352, 1))
-            bmvs[1] = np.zeros((288, 352, 1))
-    else:
-        bmvs[0] = bmvs[0] * (-2.0)
-        bmvs[1] = bmvs[1] * (-2.0)        
- 
-    if bmvs[2] is None or bmvs[3] is None:
-        if 'ultra_video_group' in before_x:
-            bmvs[2] = np.zeros((1072, 1920, 1))
-            bmvs[3] = np.zeros((1072, 1920, 1))
-        else:
-            bmvs[2] = np.zeros((288, 352, 1))
-            bmvs[3] = np.zeros((288, 352, 1))
-    else:
-        bmvs[2] = bmvs[2] * (-2.0)
-        bmvs[3] = bmvs[3] * (-2.0)        
+            if bmv.shape[:2] != (height, width):
+                bmv = cv2.resize(bmv, (width, height),
+                                 interpolation=cv2.INTER_LINEAR)
+            bmv = bmv.reshape(height, width, 1).astype(float) * (-2.0)
+        bmvs.append(bmv)
 
     return bmvs
 
@@ -135,14 +144,26 @@ def get_group_filenames(filename, img_idx, distance1, distance2):
     return filenames
 
 
-def get_bmv_filenames(mv_dir, main_fn):
+def get_bmv_filenames(mv_dir, main_fn, root):
 
-    fn = main_fn.split('/')[-1][:-4]
+    fn = os.path.basename(main_fn)[:-4]
+    rel_dir = os.path.relpath(os.path.dirname(main_fn), root)
+    base_dir = mv_dir if rel_dir == os.curdir else os.path.join(mv_dir, rel_dir)
 
-    return (os.path.join(mv_dir, fn + '_before_flow_x_0001.jpg'),
-            os.path.join(mv_dir, fn + '_before_flow_y_0001.jpg'),
-            os.path.join(mv_dir, fn + '_after_flow_x_0001.jpg'),
-            os.path.join(mv_dir, fn + '_after_flow_y_0001.jpg'))
+    suffixes = ['before_flow_x', 'before_flow_y',
+                'after_flow_x', 'after_flow_y']
+    filenames = []
+    for suffix in suffixes:
+        stem = os.path.join(base_dir, fn + '_' + suffix + '_0001')
+        for ext in ['.png', '.jpg']:
+            candidate = stem + ext
+            if os.path.isfile(candidate):
+                filenames.append(candidate)
+                break
+        else:
+            filenames.append(stem + '.png')
+
+    return tuple(filenames)
 
 
 def get_identity_grid(shape):
@@ -198,7 +219,8 @@ class ImageFolder(data.Dataset):
             else:
                 assert False, 'not implemented.'
 
-        for filename in glob.iglob(self.root + '/*png'):
+        for filename in glob.iglob(
+                os.path.join(self.root, '**', '*.png'), recursive=True):
             img_idx = int(filename[:-4].split('_')[-1])
 
             if self.args.v_compress:
@@ -246,7 +268,7 @@ class ImageFolder(data.Dataset):
 
         if self.args.warp:
             bmv = np.concatenate(get_bmv(
-                img, get_bmv_filenames(self.mv_dir, main_fn)), axis=2)
+                img, get_bmv_filenames(self.mv_dir, main_fn, self.root)), axis=2)
 
             img_idx = int(main_fn[:-4].split('_')[-1])
 

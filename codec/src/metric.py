@@ -10,7 +10,7 @@ import argparse
 
 import numpy as np
 from scipy import signal
-from scipy.ndimage.filters import convolve
+from scipy.ndimage import convolve
 from PIL import Image
 
 

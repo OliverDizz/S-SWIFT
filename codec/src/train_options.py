@@ -68,6 +68,12 @@ parser.add_argument('--num-crops', type=int, default=2,
                     help='# training crops per example.')
 parser.add_argument('--gpus', default='0', type=str,
                     help='GPU indices separated by comma, e.g. \"0,1\".')
+parser.add_argument('--num-workers', type=int, default=2,
+                    help='Number of DataLoader worker processes.')
+parser.add_argument('--early-stop', type=int, default=0,
+                    help='Stop after this many evaluations without PSNR improvement. 0 disables it.')
+parser.add_argument('--mp-context', type=str, default='fork',
+                    help='DataLoader multiprocessing context: fork or spawn.')
 
 ######## Experiment ########
 parser.add_argument('--out-dir', type=str, default='output',
@@ -88,3 +94,5 @@ parser.add_argument('--checkpoint-iters', type=int, default=10000,
                     help='Model checkpoint period.')
 parser.add_argument('--eval-iters', type=int, default=4500,
                     help='Evaluation period.')
+parser.add_argument('--tensorboard-dir', type=str, default=None,
+                    help='If set, write TensorBoard events to this directory.')

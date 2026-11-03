@@ -1,5 +1,5 @@
 from collections import namedtuple
-from scipy.misc import imsave
+from PIL import Image
 import cv2
 import numpy as np
 import time
@@ -162,7 +162,7 @@ def prepare_inputs(crops, args, unet_output1, unet_output2):
     warped_unet_output2 = []
 
     for crop_idx, data in enumerate(crops):
-        patches = Variable(data.cuda())
+        patches = Variable(data.cuda(non_blocking=True))
 
         res, frame1, frame2, flows = prepare_batch(patches, args.v_compress, args.warp)
         data_arr.append(res)
@@ -187,7 +187,7 @@ def prepare_inputs(crops, args, unet_output1, unet_output2):
 
 
 def forward_ctx(unet, ctx_frames):
-    ctx_frames = Variable(ctx_frames.cuda()) - 0.5
+    ctx_frames = Variable(ctx_frames.cuda(non_blocking=True)) - 0.5
     frame1 = ctx_frames[:, :3]
     frame2 = ctx_frames[:, 3:]
 
@@ -208,7 +208,7 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
     res, _, _, flows = cooked_batch
     in_img = res
 
-    ctx_frames = Variable(ctx_frames.cuda()) - 0.5
+    ctx_frames = Variable(ctx_frames.cuda(non_blocking=True)) - 0.5
     frame1 = ctx_frames[:, :3]
     frame2 = ctx_frames[:, 3:]
 
@@ -312,17 +312,13 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
 
 
 def save_numpy_array_as_image(filename, arr):
-    imsave(
-        filename,
-        np.squeeze(arr * 255.0).astype(np.uint8)
-        .transpose(1, 2, 0))
+    image = np.squeeze(arr * 255.0).astype(np.uint8).transpose(1, 2, 0)
+    Image.fromarray(image).save(filename)
 
 
 def save_torch_array_as_image(filename, arr):
-    imsave(
-        filename,
-        np.squeeze(arr.numpy().clip(0, 1) * 255.0).astype(np.uint8)
-        .transpose(1, 2, 0))
+    image = np.squeeze(arr.numpy().clip(0, 1) * 255.0).astype(np.uint8)
+    Image.fromarray(image.transpose(1, 2, 0)).save(filename)
 
 
 def evaluate(original, out_imgs):
@@ -393,43 +389,34 @@ def warp_unet_outputs(flows, unet_output1, unet_output2):
 def init_lstm(batch_size, height, width, args):
 
     encoder_h_1 = (Variable(
-        torch.zeros(batch_size, 256, height // 4, width // 4)),
+        torch.zeros(batch_size, 256, height // 4, width // 4, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 256, height // 4, width // 4)))
+                       torch.zeros(batch_size, 256, height // 4, width // 4, device='cuda')))
     encoder_h_2 = (Variable(
-        torch.zeros(batch_size, 512, height // 8, width // 8)),
+        torch.zeros(batch_size, 512, height // 8, width // 8, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 512, height // 8, width // 8)))
+                       torch.zeros(batch_size, 512, height // 8, width // 8, device='cuda')))
     encoder_h_3 = (Variable(
-        torch.zeros(batch_size, 512, height // 16, width // 16)),
+        torch.zeros(batch_size, 512, height // 16, width // 16, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 512, height // 16, width // 16)))
+                       torch.zeros(batch_size, 512, height // 16, width // 16, device='cuda')))
 
     decoder_h_1 = (Variable(
-        torch.zeros(batch_size, 512, height // 16, width // 16)),
+        torch.zeros(batch_size, 512, height // 16, width // 16, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 512, height // 16, width // 16)))
+                       torch.zeros(batch_size, 512, height // 16, width // 16, device='cuda')))
     decoder_h_2 = (Variable(
-        torch.zeros(batch_size, 512, height // 8, width // 8)),
+        torch.zeros(batch_size, 512, height // 8, width // 8, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 512, height // 8, width // 8)))
+                       torch.zeros(batch_size, 512, height // 8, width // 8, device='cuda')))
     decoder_h_3 = (Variable(
-        torch.zeros(batch_size, 256, height // 4, width // 4)),
+        torch.zeros(batch_size, 256, height // 4, width // 4, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 256, height // 4, width // 4)))
+                       torch.zeros(batch_size, 256, height // 4, width // 4, device='cuda')))
     decoder_h_4 = (Variable(
-        torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2)),
+        torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2)))
-
-    encoder_h_1 = (encoder_h_1[0].cuda(), encoder_h_1[1].cuda())
-    encoder_h_2 = (encoder_h_2[0].cuda(), encoder_h_2[1].cuda())
-    encoder_h_3 = (encoder_h_3[0].cuda(), encoder_h_3[1].cuda())
-
-    decoder_h_1 = (decoder_h_1[0].cuda(), decoder_h_1[1].cuda())
-    decoder_h_2 = (decoder_h_2[0].cuda(), decoder_h_2[1].cuda())
-    decoder_h_3 = (decoder_h_3[0].cuda(), decoder_h_3[1].cuda())
-    decoder_h_4 = (decoder_h_4[0].cuda(), decoder_h_4[1].cuda())
+                       torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2, device='cuda')))
 
     return (encoder_h_1, encoder_h_2, encoder_h_3,
             decoder_h_1, decoder_h_2, decoder_h_3, decoder_h_4)
@@ -437,25 +424,20 @@ def init_lstm(batch_size, height, width, args):
 def init_d2(batch_size, height, width, args):
 
     decoder_h_1 = (Variable(
-        torch.zeros(batch_size, 512, height // 16, width // 16)),
+        torch.zeros(batch_size, 512, height // 16, width // 16, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 512, height // 16, width // 16)))
+                       torch.zeros(batch_size, 512, height // 16, width // 16, device='cuda')))
     decoder_h_2 = (Variable(
-        torch.zeros(batch_size, 512, height // 8, width // 8)),
+        torch.zeros(batch_size, 512, height // 8, width // 8, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 512, height // 8, width // 8)))
+                       torch.zeros(batch_size, 512, height // 8, width // 8, device='cuda')))
     decoder_h_3 = (Variable(
-        torch.zeros(batch_size, 256, height // 4, width // 4)),
+        torch.zeros(batch_size, 256, height // 4, width // 4, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 256, height // 4, width // 4)))
+                       torch.zeros(batch_size, 256, height // 4, width // 4, device='cuda')))
     decoder_h_4 = (Variable(
-        torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2)),
+        torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2, device='cuda')),
                    Variable(
-                       torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2)))
-
-    decoder_h_1 = (decoder_h_1[0].cuda(), decoder_h_1[1].cuda())
-    decoder_h_2 = (decoder_h_2[0].cuda(), decoder_h_2[1].cuda())
-    decoder_h_3 = (decoder_h_3[0].cuda(), decoder_h_3[1].cuda())
-    decoder_h_4 = (decoder_h_4[0].cuda(), decoder_h_4[1].cuda())
+                       torch.zeros(batch_size, 256 if False else 128, height // 2, width // 2, device='cuda')))
 
     return (decoder_h_1, decoder_h_2, decoder_h_3, decoder_h_4)
