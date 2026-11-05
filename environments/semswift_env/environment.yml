@@ -1,0 +1,20 @@
+# Conda environment for the Swift codec training and evaluation.
+#
+# This reproduces the `semswift_env` environment used by
+# codec/src/training_experiments.ipynb and codec/src/train.py.
+#
+# Two steps (run from the repository root):
+#   conda env create -f environments/semswift_env/environment.yml
+#   conda activate semswift_env
+#   pip install -r environments/semswift_env/requirements.txt
+
+name: semswift_env
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - pytorch-cuda=12.4
+  - pytorch-mutex=1.0=cuda
+  - tensorboard=2.20.0
+  - pip

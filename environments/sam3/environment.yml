@@ -1,0 +1,21 @@
+# Conda environment for the dataset pipeline (download, SAM3 masks, edges).
+#
+# This reproduces the `sam3` environment used by:
+#   scripts/01_download_datasets.sh  (yt-dlp)
+#   scripts/03_sam3_masks.py         (SAM3 + PyTorch)
+#   scripts/04_canny_edges.py        (OpenCV + scikit-image)
+#
+# Two steps (run from the repository root):
+#   conda env create -f environments/sam3/environment.yml
+#   conda activate sam3
+#   pip install -r environments/sam3/requirements.txt
+#
+# SAM3 is a git submodule; fetch it before the editable install:
+#   git submodule update --init --recursive
+
+name: sam3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip

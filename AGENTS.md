@@ -37,7 +37,9 @@ when the README and the code disagree.
 | `codec/semantic/` | Semantic Swift codec under development for a research paper. It will use SAM3 segmentation masks. The folder is empty now. |
 | `codec/icodec/` | Separate progressive I-frame codec. It derives from `pytorch-image-comp-rnn`. |
 | `codec/laplacian/`, `codec/singleshot/` | Experimental codec variants and ablation codecs. They are not part of the main path. |
-| `data/` | Codec training and evaluation data. `data/train_mv` and `data/eval_mv` hold motion vectors. The notebook writes `data/prepared_352x288/`. |
+| `data/` | Codec training and evaluation data. The `scripts/` pipeline writes `data/kinetics/`, `data/derf/`, and `data/uvg/`. |
+| `scripts/` | Dataset download and preparation pipeline. It downloads Kinetics-400 from the CVDF mirror, derf, and UVG. It extracts motion vectors, SAM3 masks, and Canny edges. |
+| `environments/` | Conda and pip environment files for `semswift_env`, `sam3`, and `mv_env`. |
 | `streamer/` | Grad-style ABR simulator, actor-critic agent, mahimahi traces, example model, and chunk-size tables. |
 | `baselines/svc/`, `baselines/shvc/` | MPEG reference software for H.264 SVC and H.265 SHVC comparisons. The Python code does not call this software. |
 | `assets/` | Paper and architecture figure. |
@@ -64,6 +66,25 @@ video frames
   -> external/sam3 extracts segmentation masks
   -> codec/semantic trains and encodes with mask information
 ```
+
+## Dataset pipeline (`scripts/`)
+
+The `scripts/` pipeline downloads and prepares the codec data. Run the steps in order.
+
+1. `01_download_datasets.sh` downloads the raw data and decodes frames.
+   - Kinetics-400 comes from the CVDF S3 mirror (`https://s3.amazonaws.com/kinetics/400/`). The mirror serves `part_N.tar.gz` archives. Do not use YouTube or yt-dlp.
+   - The committed manifest `scripts/manifests/kinetics_split.csv` fixes the exact 8,000 train and 2,000 test clips. A fresh clone reproduces the same split.
+   - The script downloads `K400_TRAIN_PARTS` train archives and `K400_VAL_PARTS` val archives. It decodes the manifest clips and cross-validates each clip against `train.csv`/`val.csv` and the expected 100 frames.
+   - It reports missing clips and label or frame-count mismatches. Raise the part counts when clips are missing. Use `--resample` to create a new split.
+   - It writes 100 frames per clip at 352x288. It writes the val split as the `test` split.
+   - derf and UVG frames use native resolution. The script validates them against `scripts/manifests/{derf,uvg}_sequences.csv`.
+2. `02_motion_vectors.sh` builds the motion-vector tools in `mv_env`. It then extracts motion vectors for each frame.
+3. `03_sam3_masks.py` writes binary SAM3 ROI masks in the `sam3` env. SAM3 segments noun concepts, not actions. Kinetics labels are actions, so the script prompts `person` by default. `scripts/kinetics_prompts.yaml` overrides this per class. It needs Hugging Face access to `facebook/sam3`. It reuses one session per clip and propagates forward by default. It uses all visible GPUs by default and launches one worker per GPU. It checkpoints progress after each clip and resumes on the next run. For long runs, use `--restart-every` and `--offload-video`. Do not use `--compile` for long runs: its CUDA-graph memory grows and can OOM. Use `--gpus`, `--gpu`, or `--shard-index`/`--num-shards` to override GPU selection.
+4. `04_canny_edges.py` writes binary Canny edge maps in the `sam3` env.
+
+`scripts/config.env` holds the shared settings. `scripts/config.py` reads it. The scripts find the conda environments automatically from `$CONDA_ENVS_DIR`, `~/conda_envs`, `~/.conda/envs`, or `<conda base>/envs`.
+
+Use the environment files in `environments/` to create the three conda environments.
 
 ## Codec details (`codec/`)
 
@@ -361,17 +382,15 @@ take the argmax. Therefore test results are stochastic.
 
 ## Environment and dependencies
 
-- The streamer uses TensorFlow 1.x-style APIs and `tflearn`. The repo has no
-  `requirements.txt`. The streamer will not work unchanged on a modern TensorFlow
-  2-only install.
+- The streamer uses TensorFlow 1.x-style APIs and `tflearn`. The streamer will not work unchanged on a modern TensorFlow 2-only install.
+- The repository has environment files under `environments/`, one subfolder per conda environment. `semswift_env` runs the codec. `sam3` runs the masks and edges. `mv_env` runs the motion-vector tools. The download step uses system tools only.
 - The codec still uses some old PyTorch idioms: `Variable`, `.data`, and
   `volatile=True`. The codec no longer uses `scipy.misc`. It uses PIL and
   `scipy.ndimage` instead.
 - The codec runs in the `semswift_env` conda environment. That environment uses
   PyTorch 2.14.1+cu126, torchvision 0.29.1+cu126, TensorBoard 2.20.0, and
   setuptools<81. Do not install a CUDA 13 build on the school hosts.
-- `flows/get_mv.sh` contains hardcoded paths such as `/home/mallesh/...`. It needs
-  FFmpeg 2.7.2 or 3.4.6 and OpenCV 2.4.11-era tools. Do not assume that it runs as-is.
+- `flows/get_mv.sh` is parameterized. It takes the input directory, output directory, width, height, and frame type. `scripts/02_motion_vectors.sh` builds and runs it in `mv_env` with FFmpeg 2.8.6 and OpenCV 2.4.11.
 - `codec/src/data/*` are symlinks to the original authors' NFS paths. They are broken
   in this checkout. Do not use them. Use the repository `data/` tree instead. The
   notebook writes a 352x288 frame cache to `data/prepared_352x288/`.

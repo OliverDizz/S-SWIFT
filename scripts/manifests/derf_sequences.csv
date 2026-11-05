@@ -1,0 +1,11 @@
+seq,filename,width,height,n_frames
+blue_sky,blue_sky_1080p25.y4m,1920,1080,217
+flower,flower_cif.y4m,352,288,250
+foreman,foreman_cif.y4m,352,288,300
+four_people,FourPeople_1280x720_60.y4m,1280,720,601
+soccer,soccer_cif.y4m,352,288,300
+stefan,stefan_sif.y4m,352,240,300
+tennis,tennis_sif.y4m,352,240,150
+vidyo3,vidyo3_720p_60fps.y4m,1280,720,601
+waterfall,waterfall_cif.y4m,352,288,260
+silent,silent_cif.y4m,352,288,300

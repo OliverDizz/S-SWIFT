@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <iostream>
 #include <fstream>
+#include <cstdlib>
 using namespace cv;
 using namespace std;
 
@@ -56,20 +57,17 @@ int main(int argc, char** argv){
 	// string yFlowFile = cmd.get<string>("yFlowFile");
 	// string imgFile = cmd.get<string>("imgFile");
 	// int bound = cmd.get<int>("bound");
+	if (argc < 6) {
+		fprintf(stderr, "Usage: %s <vidFile> <xFlowFile> <yFlowFile> <width> <height>\n", argv[0]);
+		return -1;
+	}
 	string vidFile = argv[1];
 	string xFlowFile = argv[2];
 	string yFlowFile = argv[3];
-	// string imgFile = "tmp.png";
 	int bound = 127;
 
-    //int video_width = 640;
-    //int video_height = 360;
-    //int video_width = 256;
-    //int video_height = 256;
-    int video_width = 1920;
-    //int video_width = 480;
-    int video_height = 1080;
-    //int video_height = 200;
+	int video_width = atoi(argv[4]);
+	int video_height = atoi(argv[5]);
 
 	int frame_num = 0;
 	Mat image, prev_image, prev_grey, grey, frame;

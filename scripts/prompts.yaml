@@ -1,0 +1,29 @@
+# scripts/prompts.yaml
+#
+# SAM3 text prompts used to build ROI masks for the derf and UVG test
+# sequences. Kinetics clips use their own class label from the manifest, so
+# they are not listed here.
+#
+# Each sequence maps to an ordered list of prompts. One SAM3 session is run
+# per prompt, and the per-frame instance masks are OR-ed across prompts.
+
+derf:
+  blue_sky: ["sky", "bird", "tree"]
+  flower: ["flower", "garden", "plant"]
+  foreman: ["person", "helmet", "face"]
+  four_people: ["person", "face"]
+  soccer: ["person", "player", "ball"]
+  stefan: ["person", "player"]
+  tennis: ["person", "player", "racket"]
+  vidyo3: ["person", "face"]
+  waterfall: ["water", "waterfall"]
+  silent: ["person", "face"]
+
+uvg:
+  Beauty: ["person", "face", "hair"]
+  Bosphorus: ["boat", "water", "bridge"]
+  HoneyBee: ["bee", "flower"]
+  Jockey: ["person", "horse"]
+  ReadySetGo: ["person", "horse"]
+  ShakeNDry: ["dog", "animal"]
+  YachtRide: ["boat", "water", "person"]

@@ -1,0 +1,13 @@
+# pip dependencies for `semswift_env` (installed after the conda env above).
+#
+# PyTorch uses the cu126 wheel index, not PyPI. Do not install a CUDA 13 build
+# on the school hosts; use cu126.
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch==2.14.1+cu126
+torchvision==0.29.1+cu126
+numpy==2.2.6
+scipy==1.13.1
+opencv-python-headless==5.0.0.93
+pillow==13.0.0
+setuptools<81

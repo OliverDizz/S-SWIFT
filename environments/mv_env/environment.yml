@@ -1,0 +1,26 @@
+# Conda environment for the motion-vector toolchain.
+#
+# This reproduces the `mv_env` environment used by scripts/02_motion_vectors.sh
+# to build and run extract_mvs and MotionVector. It pins the old toolchain the
+# tools were written against: Python 2.7, OpenCV 2.4.11, and FFmpeg 2.8.x with
+# its development headers.
+#
+# One step (run from the repository root):
+#   conda env create -f environments/mv_env/environment.yml
+#
+# The `menpo` channel provides OpenCV 2.4.11; `conda-forge` provides FFmpeg 2.8.6
+# and the gcc/g++ compilers. 02_motion_vectors.sh builds MotionVector against
+# OpenCV 2.4.11 and extract_mvs against the FFmpeg development headers.
+
+name: mv_env
+channels:
+  - conda-forge
+  - menpo
+dependencies:
+  - python=2.7.18
+  - opencv=2.4.11
+  - ffmpeg=2.8.6
+  - gcc_linux-64
+  - gxx_linux-64
+  - pkg-config
+  - numpy=1.9.3

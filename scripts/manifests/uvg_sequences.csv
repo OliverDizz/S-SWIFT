@@ -1,0 +1,8 @@
+seq,filename,width,height,n_frames
+Beauty,Beauty_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,600
+Bosphorus,Bosphorus_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,600
+HoneyBee,HoneyBee_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,600
+Jockey,Jockey_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,600
+ReadySetGo,ReadySteadyGo_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,600
+ShakeNDry,ShakeNDry_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,300
+YachtRide,YachtRide_1920x1080_120fps_420_8bit_YUV.yuv,1920,1080,600
