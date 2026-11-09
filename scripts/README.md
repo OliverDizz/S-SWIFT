@@ -136,6 +136,7 @@ clips are skipped and only missing/partial clips are regenerated. For the larger
   over long runs and can OOM — avoid for full runs)
 - `--restart-every N` (rebuild the predictor every N clips to bound any leak)
 - `--offload-video` (keep video frames on CPU; lower GPU memory, slower)
+- `--max-objects N` (cap tracked instances per prompt; default 16, 0 = library default 10000)
 - `--resume` / `--no-resume`, `--progress-file PATH`
 - `--shard-index I --num-shards N` (manual shards over disjoint clips)
 - `--output-root DIR` (write elsewhere, e.g. a pilot)
@@ -147,9 +148,11 @@ full regeneration.
 
 Safeguards active in every run: `gc.collect()` + `torch.cuda.empty_cache()` per
 clip, one retry on any error then skip-and-log, and optional periodic predictor
-rebuild. The script does not force `expandable_segments`, which has caused CUDA
-allocator assertion crashes (`curr_block->next`) with `torch.compile` on long
-runs; set `PYTORCH_CUDA_ALLOC_CONF` yourself if you want a specific mode.
+rebuild. It caps tracked objects per prompt (`--max-objects`, default 16) because
+many-instance concepts (e.g. "brick") scale tracker memory with the object count.
+The script does not force `expandable_segments`, which has caused CUDA allocator
+assertion crashes (`curr_block->next`) with `torch.compile` on long runs; set
+`PYTORCH_CUDA_ALLOC_CONF` yourself if you want a specific mode.
 
 
 ### `04_canny_edges.py`
@@ -160,6 +163,25 @@ Writes binary `cv2.Canny(50, 150)` edge maps at native resolution.
 conda activate sam3
 python scripts/04_canny_edges.py
 ```
+
+### `05_fix_motion_vectors.py`
+
+Audits the motion-vector output and re-extracts only the clips that are missing
+expected flow files (instead of redoing every clip like `02_motion_vectors.sh`).
+It recomputes the expected set from `flows/get_mv.sh`, so it works for Kinetics
+and derf/UVG alike, and it appends failures to `data/manifests/mv_fix_failures.log`.
+
+```bash
+python3 scripts/05_fix_motion_vectors.py --dry-run               # audit only
+python3 scripts/05_fix_motion_vectors.py --dataset kinetics --limit 100   # pilot
+python3 scripts/05_fix_motion_vectors.py --dataset kinetics      # re-extract gaps
+```
+
+Known limitation: the bundled ffmpeg 2.8.6 + `MotionVector` pipeline
+deterministically drops long-distance motion vectors (mainly the 6-frame and
+3-frame references) on clips with large motion. Those files cannot be
+reproduced by re-running the extraction and stay listed in the failure log.
+The codec zero-fills missing motion, so the practical impact is small.
 
 ## Configuration
 

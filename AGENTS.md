@@ -11,7 +11,7 @@ The repository contains three code development lines:
 2. An online adaptive-bitrate (ABR) streaming simulator. The simulator uses a
    reinforcement-learning agent and TensorFlow 1.x APIs. It lives in `streamer/`.
 3. A semantic codec under development. It extends the Swift codec with segmentation
-   masks for a research paper. It lives in `codec/semantic/`.
+   masks and edge maps for a research paper. It lives in `codec/semantic/`.
 
 The codec exposes several quality points for each video chunk. The streamer can then
 use spare bandwidth to upgrade chunks that are already in the playback buffer. The
@@ -33,17 +33,17 @@ when the README and the code disagree.
 | --- | --- |
 | `flows/` | Extracts motion vectors with a bundled FFmpeg 2.7.2 and OpenCV code. It writes `_before_flow_x/y` and `_after_flow_x/y` images for the codec. |
 | `codec/src/` | Main hierarchical P-frame codec. It contains DDP training, evaluation, TensorBoard logging, the encoder, the decoder, the early-exit decoder, and progressive binary codes. |
-| `codec/src/training_experiments.ipynb` | Standard notebook for the three hierarchy trainings. It launches DDP training and records TensorBoard events. |
-| `codec/semantic/` | Semantic Swift codec under development for a research paper. It will use SAM3 segmentation masks. The folder is empty now. |
+| `codec/src/training_experiments.ipynb` | Standard notebook for the three base-codec hierarchy trainings. It launches DDP training and records TensorBoard events. |
+| `codec/semantic/` | Semantic Swift codec. It is an implemented copy of `codec/src/` plus SAM3 mask and Canny edge side-information. Its standard training flow is `codec/semantic/semantic_experiments.ipynb`. |
 | `codec/icodec/` | Separate progressive I-frame codec. It derives from `pytorch-image-comp-rnn`. |
 | `codec/laplacian/`, `codec/singleshot/` | Experimental codec variants and ablation codecs. They are not part of the main path. |
 | `data/` | Codec training and evaluation data. The `scripts/` pipeline writes `data/kinetics/`, `data/derf/`, and `data/uvg/`. |
-| `scripts/` | Dataset download and preparation pipeline. It downloads Kinetics-400 from the CVDF mirror, derf, and UVG. It extracts motion vectors, SAM3 masks, and Canny edges. |
+| `scripts/` | Dataset download and preparation pipeline. It downloads Kinetics-400 from the CVDF mirror, derf, and UVG. It extracts motion vectors, SAM3 masks, and Canny edges. It also audits and repairs incomplete motion-vector output. |
 | `environments/` | Conda and pip environment files for `semswift_env`, `sam3`, and `mv_env`. |
 | `streamer/` | Grad-style ABR simulator, actor-critic agent, mahimahi traces, example model, and chunk-size tables. |
 | `baselines/svc/`, `baselines/shvc/` | MPEG reference software for H.264 SVC and H.265 SHVC comparisons. The Python code does not call this software. |
 | `assets/` | Paper and architecture figure. |
-| `external/sam3/` | SAM 3 library (submodule). The semantic codec uses it to extract segmentation masks. Do not modify or vendor it. |
+| `external/sam3/` | SAM 3 library (submodule). The scripts use it to extract segmentation masks for the semantic codec. Do not modify or vendor it. |
 
 ## End-to-end data flow
 
@@ -59,12 +59,14 @@ video frames
   -> logs record quality, rebuffer time, and reward
 ```
 
-The semantic codec adds this mask path:
+The semantic codec adds this side-information path:
 
 ```text
 video frames
-  -> external/sam3 extracts segmentation masks
-  -> codec/semantic trains and encodes with mask information
+  -> scripts/03_sam3_masks.py uses external/sam3 to extract binary object masks S
+  -> scripts/04_canny_edges.py extracts binary Canny edge maps E
+  -> codec/semantic trains the visual layer with S and E
+  -> S and E are stored losslessly; the visual layer stays progressive
 ```
 
 ## Dataset pipeline (`scripts/`)
@@ -79,8 +81,9 @@ The `scripts/` pipeline downloads and prepares the codec data. Run the steps in 
    - It writes 100 frames per clip at 352x288. It writes the val split as the `test` split.
    - derf and UVG frames use native resolution. The script validates them against `scripts/manifests/{derf,uvg}_sequences.csv`.
 2. `02_motion_vectors.sh` builds the motion-vector tools in `mv_env`. It then extracts motion vectors for each frame.
-3. `03_sam3_masks.py` writes binary SAM3 ROI masks in the `sam3` env. SAM3 segments noun concepts, not actions. Kinetics labels are actions, so the script prompts `person` by default. `scripts/kinetics_prompts.yaml` overrides this per class. It needs Hugging Face access to `facebook/sam3`. It reuses one session per clip and propagates forward by default. It uses all visible GPUs by default and launches one worker per GPU. It checkpoints progress after each clip and resumes on the next run. For long runs, use `--restart-every` and `--offload-video`. Do not use `--compile` for long runs: its CUDA-graph memory grows and can OOM. Use `--gpus`, `--gpu`, or `--shard-index`/`--num-shards` to override GPU selection.
-4. `04_canny_edges.py` writes binary Canny edge maps in the `sam3` env.
+3. `03_sam3_masks.py` writes binary SAM3 ROI masks in the `sam3` env. SAM3 segments noun concepts, not actions. Kinetics labels are actions, so the script prompts `person` by default. `scripts/kinetics_prompts.yaml` overrides this per class. It needs Hugging Face access to `facebook/sam3`. It reuses one session per clip and propagates forward by default. It uses all visible GPUs by default and launches one worker per GPU. It checkpoints progress after each clip and resumes on the next run. For long runs, use `--restart-every` and `--offload-video`. `--max-objects` caps tracked instances per prompt (default 16) so many-instance concepts cannot exhaust memory. Do not use `--compile` for long runs: its CUDA-graph memory grows and can OOM. Use `--gpus`, `--gpu`, or `--shard-index`/`--num-shards` to override GPU selection. For Kinetics it writes `data/kinetics/{train,test}_masks/<clip>/`.
+4. `04_canny_edges.py` writes binary Canny edge maps in the `sam3` env. For Kinetics it writes `data/kinetics/{train,test}_edges/<clip>/`.
+5. `05_fix_motion_vectors.py` audits the motion-vector directories and re-extracts only incomplete clips. It runs with system `python3` and uses the `mv_env` binaries. Use `--dry-run` first. It writes an incomplete list to `data/manifests/mv_incomplete.txt` and appends failures to `data/manifests/mv_fix_failures.log`.
 
 `scripts/config.env` holds the shared settings. `scripts/config.py` reads it. The scripts find the conda environments automatically from `$CONDA_ENVS_DIR`, `~/conda_envs`, `~/.conda/envs`, or `<conda base>/envs`.
 
@@ -129,8 +132,14 @@ target frame coordinate system with `grid_sample`. The encoder and decoder fuse 
 warped features. See `get_flows()`, `warp_unet_outputs()`, and `prepare_inputs()` in
 `codec/src/util.py`.
 
-Missing motion-vector files produce zero-filled motion and a warning. Fix the
-extraction before a long run.
+Missing motion-vector files produce zero-filled motion and a warning. These gaps
+are largely deterministic: the bundled ffmpeg 2.8.6 + `MotionVector` pipeline
+drops long-distance motion vectors (mostly the 6-frame and 3-frame references)
+on clips with large motion, so re-running `02_motion_vectors.sh` does not fill
+them. They affect ~0.1% of flow files (681/10,000 clips have at least one) and
+are zero-filled by the codec, so the impact on training is small.
+`scripts/05_fix_motion_vectors.py` audits the gaps and re-extracts incomplete
+clips.
 
 ### Progressive coding
 
@@ -183,17 +192,73 @@ multiple quality levels. I-frames use this codec. Inter-frames use `codec/src/`.
 
 ### Semantic codec (`codec/semantic/`)
 
-The `codec/semantic/` folder is the development location for the semantic Swift codec.
-The folder is empty now. The semantic codec will extend the Swift codec with semantic
-information for a research paper.
+`codec/semantic/` is an implemented copy of `codec/src/` plus semantic
+extensions. The base tree stays pristine for baseline comparisons. The two trees
+are maintained separately; a change in one tree does not propagate to the other.
 
-The semantic codec will use segmentation masks. Extract the masks with SAM3 from
-`external/sam3` for training. This work reserves the existing `data/train_masks`,
-`data/eval_masks`, `data/train_edges`, and `data/eval_edges` folders. The base codec in
-`codec/src/` ignores masks and edge maps.
+Each target frame gets two binary side-information layers:
 
-Reuse the existing codec code where practical. Do not copy the training loop into
-`codec/semantic/`. Import the base modules or add controlled extensions.
+- `S`: the SAM3 object mask, called the semantic base layer.
+- `E`: the Canny edge map, called the structural layer.
+
+`dataset.py` appends `S` and `E` as channels 13 and 14. The loaded tensor
+therefore has 15 channels: 3 target + 6 context + 4 motion-vector + `S` + `E`.
+The base codec uses 13 channels. The loader zero-fills a missing mask or edge
+file, so training can start before extraction finishes. `ctx_frames` uses
+channels `[0, 1, 2, 6, 7, 8]`, so `S` and `E` never enter the context U-Net.
+
+The mask and edge layers are lossless in this version. `mask_codec.py` packs
+them with `np.packbits` and `np.savez_compressed`. Evaluation reports their cost
+as bytes per frame. `mask_iou()` and `edge_f1()` in `semantic_metrics.py` are
+placeholders and are not used yet.
+
+The visual loss is weighted by
+
+```text
+W = 1 + alpha_sem * S + alpha_edge * E
+```
+
+normalized to mean 1 per sample. `--alpha-sem` defaults to 1.0 and
+`--alpha-edge` to 0.5. With no mask or edge input, `W` is all ones, so the loss
+matches the baseline.
+
+`--use-conditioning` adds `MaskAdd` in the encoder and `FiLM` modulation in
+`DecoderCell` and `DecoderCell2` at the four pixel-shuffle scales. These modules
+read `(S, E)` and do not change the input channels of existing layers. The new
+heads are randomly initialized. `train.py` uses a strict `load_state_dict`, so a
+conditioned model cannot resume from an A/B checkpoint. Train C from scratch.
+
+The ablation ladder is:
+
+- **A**: baseline copy, no mask or edge arguments.
+- **B**: weighted loss (`--train-mask`, `--eval-mask`, `--train-edge`,
+  `--eval-edge`, `--alpha-sem`, `--alpha-edge`). The architecture is unchanged,
+  so B is checkpoint-compatible with A.
+- **C**: B plus `--use-conditioning`.
+
+A uses the baseline loss from `codec/src`. The notebook never adds
+`--use-wlpips` to A. For B and C, `USE_WLPIPS` controls the weighted LPIPS
+term and it is on by default. Set `USE_WLPIPS = False` to train B and C
+without it.
+
+The semantic notebook reads these paths:
+
+```text
+data/kinetics/train|test/<clip>/frame_%04d.png
+data/kinetics/train_mv|test_mv/<clip>/...
+data/kinetics/train_masks|test_masks/<clip>/frame_%04d.png
+data/kinetics/train_edges|test_edges/<clip>/frame_%04d.png
+```
+
+derf and UVG use `data/<dataset>/{frames,mv,masks,edges}/<seq>/`. Use `data/`,
+not `data_old/` or the original authors' paths.
+
+The new modules are `semantic_loss.py` (weighted L1 and weighted LPIPS),
+`conditioning.py` (`MaskAdd` and `FiLM`), `mask_codec.py` (lossless mask/edge
+bytes), and `semantic_metrics.py` (VMAF, LPIPS, and unused IoU/F1 helpers).
+`--use-wlpips` adds a VGG16 feature-space LPIPS term to training.
+`--use-vmaf` and `--use-lpips` add eval-only metrics and are best-effort. They
+return `None` or print nothing when the optional backend is missing.
 
 Do not modify or vendor `external/sam3`. Treat it as an external dependency.
 
@@ -223,17 +288,44 @@ The notebook does these steps:
 5. Streams the output to the notebook and to `train.log`.
 6. Records TensorBoard events and best checkpoints.
 
+### Semantic notebook flow
+
+Use `codec/semantic/semantic_experiments.ipynb` for the semantic trainings. The
+notebook does these steps:
+
+1. Selects GPUs with `PREFERRED_GPU_IDS` and `AUTO_SELECT_GPUS`. It requires at
+   least 12 GiB free on each selected GPU. It sets `CUDA_VISIBLE_DEVICES` before
+   it imports PyTorch.
+2. Sets `HIERARCHIES`, `ABLATION` (`A`, `B`, or `C`), and the loss and metric
+   flags.
+3. Runs the mask/edge inspection cell. Run this cell before a long training.
+4. Builds and checks the train and eval datasets for each hierarchy level.
+5. Launches `codec/semantic/train.py` with `torchrun` and DDP, one cell per run.
+6. Writes logs, TensorBoard events, checkpoints, and evaluation outputs under
+   `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/`.
+7. Loads a saved checkpoint and runs standalone evaluation. The evaluation cell
+   uses `EVAL_ABLATION` to select the ablation.
+
+Set `QUICK_TEST = True` for a short check. The notebook passes
+`--mp-context spawn` and `--eval-stride 8`, which evaluates every eighth test
+sample. Run the standalone evaluation cell only after the selected hierarchy
+trainings finish. An evaluation between trainings keeps a model and CUDA-cached
+memory alive during the next training.
+
 ### Distributed training
 
 `codec/src/train.py` uses `DistributedDataParallel` with the NCCL backend.
-The notebook launches it with this command:
+`codec/semantic/train.py` uses the same pattern. The notebook launches it with
+this command:
 
 ```bash
 python -m torch.distributed.run --nproc_per_node <N> train.py ...
 ```
 
 `CUDA_VISIBLE_DEVICES` selects the physical GPUs. Do not use `--gpus` for DDP.
-`train.py` falls back to single-GPU mode when `LOCAL_RANK` is absent.
+`train.py` falls back to single-GPU mode when `LOCAL_RANK` is absent. The
+semantic `dataset.py` also shards the eval split with `DistributedSampler` when
+`world_size > 1`. `train.py` averages the evaluation metrics across ranks.
 
 The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 `up4` layer. Remove `up4` only after you migrate the checkpoints.
@@ -243,10 +335,23 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 - `run_training()` renames an old `train.log` to `train_<timestamp>.log`.
 - The new `train.log` is empty at first. The notebook buffers it. TensorBoard is the
   real-time view.
-- TensorBoard events accumulate in `experiments/hierarchy_<level>/tensorboard/`.
+- For the base codec, TensorBoard events accumulate in
+  `experiments/hierarchy_<level>/tensorboard/`.
 - `save_best()` writes `*_best.pth` when evaluation PSNR improves.
 - `RESUME_FROM` continues a level from a saved checkpoint.
 - `latest_iteration()` ignores `*_best.pth` files.
+- The semantic notebook writes `train.log`, `hierarchy<level>_<net>_<iter>.pth`,
+  TensorBoard events, packed codes, and probe images under
+  `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/`.
+- Each semantic ablation has its own `model/`, `output/`, `tensorboard/`, and
+  `train.log` subtree. A/B/C runs do not overwrite each other. The checkpoint
+  prefix stays `hierarchy<level>`.
+- In the semantic notebook, `--save-codes` writes packed code files under
+  `output/<suffix>/codes/`. `--save-out-img` is accepted, but `evaluate.py` does
+  not dump per-frame images. Evaluation always writes one probe frame per run
+  under `output/probe/`.
+- Semantic evaluation reports loss, MS-SSIM, PSNR, the four early-exit PSNRs,
+  mask and edge bytes per frame, and optional VMAF and LPIPS.
 
 ### Performance notes
 
@@ -259,6 +364,10 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 - Keep DataLoader `persistent_workers=True`. Worker churn caused a host OOM kill in an
   earlier run.
 - Monitor `system/host_mem_available_gb` and `train/batch_sec` in TensorBoard.
+- A 20k semantic run on two ~20 GiB GPUs takes about 3 hours at ~0.5 s/iteration.
+  Keep `--eval-stride` above 1 to bound evaluation time.
+- `--use-wlpips` adds a VGG16 forward pass and extra memory. Turn it off when
+  memory is tight.
 
 ## Streamer details (`streamer/`)
 
@@ -393,12 +502,18 @@ take the argmax. Therefore test results are stochastic.
 - `flows/get_mv.sh` is parameterized. It takes the input directory, output directory, width, height, and frame type. `scripts/02_motion_vectors.sh` builds and runs it in `mv_env` with FFmpeg 2.8.6 and OpenCV 2.4.11.
 - `codec/src/data/*` are symlinks to the original authors' NFS paths. They are broken
   in this checkout. Do not use them. Use the repository `data/` tree instead. The
-  notebook writes a 352x288 frame cache to `data/prepared_352x288/`.
+  base notebook writes a 352x288 frame cache to `data/prepared_352x288/`.
+- The semantic notebook reads `data/kinetics/` directly. It does not use
+  `data/prepared_352x288/` and does not resize the Kinetics frames, masks, or
+  edges.
+- Both codec trees use OpenCV and PIL. Weighted LPIPS needs torchvision VGG16.
+  VMAF is optional and needs the ffmpeg `libvmaf` filter or the `vmaf`
+  command-line tool. All run in `semswift_env`.
 - The streamer sets `CUDA_VISIBLE_DEVICES=''`. It is CPU-only.
 - `baselines/svc` and `baselines/shvc` are separate MPEG reference codebases. They are
   not integrated with the Python pipeline.
-- The base codec and the streamer do not use `external/sam3`. The semantic codec uses
-  it to extract segmentation masks.
+- The base codec and the streamer do not use `external/sam3`. The scripts use it to
+  extract segmentation masks. The semantic codec reads the extracted masks.
 
 ## Working conventions for agents
 
@@ -416,8 +531,20 @@ take the argmax. Therefore test results are stochastic.
   - `streamer/test_grad.py`.
 - Keep training and testing behavior in sync when you modify the reward or upgrade
   logic. The two files duplicate a large action-selection block.
-- Do not modify or vendor `external/sam3`. Use it as an external dependency for the
-  semantic codec.
+- Do not modify or vendor `external/sam3`. Use it as an external dependency for
+  mask extraction.
+- Keep `codec/src/` and `codec/semantic/` separate. The semantic tree is a
+  maintained copy, not an import shim. Re-apply valid baseline fixes to
+  `codec/semantic/` manually, and make semantic-only changes only in
+  `codec/semantic/`.
+- Preserve semantic checkpoint compatibility when you change the architecture.
+  A and B share the same state-dict keys. C adds `mask_add` and `film*` keys, and
+  strict resume fails across the A/B-to-C boundary. Warm-start A/B from a
+  compatible checkpoint, but train C from scratch.
+- Do not commit `codec/semantic/experiments/`, checkpoints, logs, TensorBoard
+  events, packed `.codes` files, or probe images.
+- `codec/semantic/train.sh` and `codec/semantic/train_kinetics.sh` are legacy
+  recipes with demo data or old NFS paths. Use the notebook for new runs.
 - Use `torchrun` or `python -m torch.distributed.run` with
   `DistributedDataParallel` for multi-GPU codec training. Do not use
   `torch.nn.DataParallel`. DataParallel is single-process and it caused severe
@@ -434,9 +561,13 @@ take the argmax. Therefore test results are stochastic.
 - Write `AGENTS.md` in ASD-STE100 Simplified Technical English. Use short sentences
   and active voice.
 - The repo has no formal lint, typecheck, or test harness. Use targeted smoke tests:
-  - For the codec, run `python -m py_compile`. Then run a short DDP training with
-    `--max-train-iters 20`, `--eval-iters 15`, `--num-workers 2`, and
-    `--mp-context spawn`. Check the exit code, the loss lines, and the best checkpoint.
+  - For the base codec, run `python -m py_compile`. Then run a short DDP training
+    with `--max-train-iters 20`, `--eval-iters 15`, `--num-workers 2`, and
+    `--mp-context spawn`. Check the exit code, the loss lines, and the best
+    checkpoint.
+  - For the semantic codec, compile the changed modules and run the notebook with
+    `QUICK_TEST = True` on level 0. Run the mask/edge inspection cell first. Check
+    the loss lines, the mask and edge byte counts, and the best checkpoint.
   - For the streamer, run a short `test_grad.py` call against one trace. Then check the
     logs and the reward.
 - Use `python`, not `python3`, only when the configured `python_path` points there.

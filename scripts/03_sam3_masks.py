@@ -19,6 +19,8 @@ Long-run safeguards:
   --restart-every N rebuild the predictor every N processed clips (bounds leaks;
                     use 0=off with --compile to avoid recompiling)
   --offload-video   keep video frames on CPU (saves GPU memory, slower)
+  --max-objects N   cap tracked instances per prompt (default 16; bounds memory;
+                    many-instance concepts like "brick" otherwise scale memory up)
   per-clip gc + empty_cache, one retry on any error then skip-and-log, and no
   forced expandable_segments (a known allocator-assertion trigger with compile)
 
@@ -248,6 +250,18 @@ def build_predictor(gpu: int, checkpoint: str | None, compile_model: bool):
     return build_sam3_video_predictor(**kwargs)
 
 
+def apply_object_cap(predictor, limit: int) -> None:
+    """Bound tracked instances per prompt; SAM3 defaults to 10000 (unlimited).
+
+    Many-instance concepts (e.g. "brick") would otherwise track hundreds of
+    objects and exhaust GPU memory, since tracker memory scales with objects.
+    """
+    if limit and limit > 0:
+        model = getattr(predictor, "model", None)
+        if model is not None and hasattr(model, "max_num_objects"):
+            model.max_num_objects = limit
+
+
 def visible_gpu_ids() -> list[int]:
     """Return CUDA-visible GPU indices (respects CUDA_VISIBLE_DEVICES)."""
     try:
@@ -421,6 +435,9 @@ def main(argv: list[str]) -> int:
                         action="store_false")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--offload-video", action="store_true")
+    parser.add_argument("--max-objects", type=int, default=16,
+                        help="Cap tracked objects per prompt to bound memory "
+                             "(0 = library default 10000)")
     parser.add_argument("--restart-every", type=int, default=0)
     parser.add_argument("--resume", dest="resume", action="store_true",
                         default=True)
@@ -499,6 +516,7 @@ def main(argv: list[str]) -> int:
 
     build_start = time.perf_counter()
     predictor = build_predictor(gpu, args.checkpoint, args.compile)
+    apply_object_cap(predictor, args.max_objects)
     build_s = time.perf_counter() - build_start
 
     import torch
@@ -607,6 +625,7 @@ def main(argv: list[str]) -> int:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 predictor = build_predictor(gpu, args.checkpoint, args.compile)
+                apply_object_cap(predictor, args.max_objects)
                 since_build = 0
                 bar.log(f"[maintenance] rebuilt predictor after "
                         f"{args.restart_every} clips")
