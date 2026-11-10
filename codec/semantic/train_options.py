@@ -38,9 +38,46 @@ parser.add_argument('--use-wlpips', action='store_true',
 parser.add_argument('--lpips-weight', type=float, default=0.1,
                     help='Weight of the (weighted) LPIPS term.')
 
+######## Region loss (Design A) ########
+parser.add_argument('--loss-mode', type=str, default='legacy',
+                    choices=['legacy', 'region'],
+                    help='legacy = current W path; region = explicit ROI/bg/edge loss.')
+parser.add_argument('--roi-weight', type=float, default=2.0,
+                    help='Weight of the ROI term in region mode.')
+parser.add_argument('--bg-weight', type=float, default=0.5,
+                    help='Weight of the background term in region mode.')
+parser.add_argument('--edge-weight', type=float, default=0.5,
+                    help='Weight of the edge term in region mode.')
+parser.add_argument('--boundary-band', type=int, default=0,
+                    help='Pixels; 0 = hard S, >0 = boost a dilated boundary band.')
+parser.add_argument('--boundary-weight', type=float, default=0.5,
+                    help='Extra weight for the boundary band.')
+parser.add_argument('--roi-ramp', type=str, default='none',
+                    choices=['none', 'linear'],
+                    help='none or linear; ramp ROI emphasis across progressive steps.')
+parser.add_argument('--roi-ramp-start', type=float, default=0.5,
+                    help='ROI weight multiplier at step 1 when roi-ramp=linear.')
+parser.add_argument('--lpips-scope', type=str, default='full',
+                    choices=['full', 'roi'],
+                    help='full or roi; region LPIPS weighting scope.')
+parser.add_argument('--lpips-steps', type=str, default='final',
+                    choices=['final', 'last3', 'all'],
+                    help='final, last3, or all; progressive steps for LPIPS.')
+
 ######## Semantic conditioning ########
 parser.add_argument('--use-conditioning', action='store_true',
                     help='Enable semantic conditioning (encoder MaskAdd + decoder FiLM).')
+parser.add_argument('--conditioning-mode', type=str, default='legacy',
+                    choices=['legacy', 'spatial'],
+                    help='legacy = pooled FiLM; spatial = spatially varying FiLM.')
+parser.add_argument('--conditioning-init', type=str, default='random',
+                    choices=['random', 'zero'],
+                    help='random or zero; zero initializes new conditioning heads.')
+parser.add_argument('--load-strict', type=str, default='true',
+                    choices=['true', 'false'],
+                    help='false loads shared weights and ignores new keys (warm start).')
+parser.add_argument('--load-model-dir', type=str, default=None,
+                    help='Optional source model directory for warm starts.')
 
 ######## Semantic metrics ########
 parser.add_argument('--use-vmaf', action='store_true',
@@ -104,6 +141,9 @@ parser.add_argument('--num-workers', type=int, default=2,
                     help='Number of DataLoader worker processes.')
 parser.add_argument('--early-stop', type=int, default=0,
                     help='Stop after this many evaluations without PSNR improvement. 0 disables it.')
+parser.add_argument('--best-metric', type=str, default='last',
+                    choices=['last', 'mean', 'max'],
+                    help='PSNR criterion for best checkpoint: last, mean, or max over steps.')
 parser.add_argument('--mp-context', type=str, default='fork',
                     help='DataLoader multiprocessing context: fork or spawn.')
 

@@ -3,12 +3,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from modules import ConvLSTMCell, Sign
-from conditioning import MaskAdd, FiLM
+from conditioning import MaskAdd, FiLM, SpatialFiLM
+
+
+def _make_film(in_ch, out_ch, mode, init):
+    if mode == 'spatial':
+        return SpatialFiLM(in_ch, out_ch, init=init)
+    return FiLM(in_ch, out_ch)
 
 
 class EncoderCell(nn.Module):
     def __init__(self, v_compress, stack, fuse_encoder, fuse_level,
-                 use_conditioning=False):
+                 use_conditioning=False, conditioning_mode='legacy',
+                 conditioning_init='random'):
         super(EncoderCell, self).__init__()
 
         # Init.
@@ -16,6 +23,8 @@ class EncoderCell(nn.Module):
         self.fuse_encoder = fuse_encoder
         self.fuse_level = fuse_level
         self.use_conditioning = use_conditioning
+        self.conditioning_mode = conditioning_mode
+        self.conditioning_init = conditioning_init
         if fuse_encoder:
             print('\tEncoder fuse level: {}'.format(self.fuse_level))
 
@@ -27,7 +36,7 @@ class EncoderCell(nn.Module):
 
         self.mask_add = None
         if use_conditioning:
-            self.mask_add = MaskAdd(2, 64)
+            self.mask_add = MaskAdd(2, 64, init=conditioning_init)
 
         self.rnn1 = ConvLSTMCell(
             128 if fuse_encoder and v_compress else 64,
@@ -101,7 +110,8 @@ class Binarizer(nn.Module):
 
 class DecoderCell(nn.Module):
     def __init__(self, v_compress, shrink, bits, fuse_level,
-                 use_conditioning=False):
+                 use_conditioning=False, conditioning_mode='legacy',
+                 conditioning_init='random'):
 
         super(DecoderCell, self).__init__()
 
@@ -109,6 +119,8 @@ class DecoderCell(nn.Module):
         self.v_compress = v_compress
         self.fuse_level = fuse_level
         self.use_conditioning = use_conditioning
+        self.conditioning_mode = conditioning_mode
+        self.conditioning_init = conditioning_init
         print('\tDecoder fuse level: {}'.format(self.fuse_level))
 
         # Layers.
@@ -158,10 +170,10 @@ class DecoderCell(nn.Module):
             3,
             kernel_size=1, stride=1, padding=0, bias=False)
 
-        self.film1 = FiLM(2, 512) if use_conditioning else None
-        self.film2 = FiLM(2, 512) if use_conditioning else None
-        self.film3 = FiLM(2, 256) if use_conditioning else None
-        self.film4 = FiLM(2, 128) if use_conditioning else None
+        self.film1 = _make_film(2, 512, conditioning_mode, conditioning_init) if use_conditioning else None
+        self.film2 = _make_film(2, 512, conditioning_mode, conditioning_init) if use_conditioning else None
+        self.film3 = _make_film(2, 256, conditioning_mode, conditioning_init) if use_conditioning else None
+        self.film4 = _make_film(2, 128, conditioning_mode, conditioning_init) if use_conditioning else None
 
     def forward(self, input, hidden1, hidden2, hidden3, hidden4,
                 unet_output1, unet_output2, sem=None):
@@ -245,7 +257,8 @@ class EarlyExit(nn.Module):
 
 class DecoderCell2(nn.Module):
     def __init__(self, v_compress, shrink, bits, fuse_level,
-                 use_conditioning=False):
+                 use_conditioning=False, conditioning_mode='legacy',
+                 conditioning_init='random'):
 
         super(DecoderCell2, self).__init__()
 
@@ -253,6 +266,8 @@ class DecoderCell2(nn.Module):
         self.v_compress = v_compress
         self.fuse_level = fuse_level
         self.use_conditioning = use_conditioning
+        self.conditioning_mode = conditioning_mode
+        self.conditioning_init = conditioning_init
         print('\tDecoder fuse level: {}'.format(self.fuse_level))
 
         # Layers.
@@ -314,10 +329,10 @@ class DecoderCell2(nn.Module):
             3,
             kernel_size=1, stride=1, padding=0, bias=False)
 
-        self.film1 = FiLM(2, 512) if use_conditioning else None
-        self.film2 = FiLM(2, 512) if use_conditioning else None
-        self.film3 = FiLM(2, 256) if use_conditioning else None
-        self.film4 = FiLM(2, 128) if use_conditioning else None
+        self.film1 = _make_film(2, 512, conditioning_mode, conditioning_init) if use_conditioning else None
+        self.film2 = _make_film(2, 512, conditioning_mode, conditioning_init) if use_conditioning else None
+        self.film3 = _make_film(2, 256, conditioning_mode, conditioning_init) if use_conditioning else None
+        self.film4 = _make_film(2, 128, conditioning_mode, conditioning_init) if use_conditioning else None
 
     def forward(self, input, hidden1, hidden2, hidden3, hidden4,
                 unet_output1, unet_output2, sem=None):

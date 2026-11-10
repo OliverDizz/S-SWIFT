@@ -23,6 +23,8 @@ except ImportError:  # pragma: no cover
 
 from PIL import Image
 
+from metric import msssim
+
 _VGG_RELU_INDICES = {
     'relu1_2': 3,
     'relu2_2': 8,
@@ -223,4 +225,132 @@ def lpips(ref, dist, device=None):
         for layer in _VGG_LAYERS:
             d = (a_ref[layer] - a_dist[layer]).norm(2, dim=1).mean()
             total = total + float(d)
+    return total / len(_VGG_LAYERS)
+
+
+def psnr_masked(ref, dist, mask):
+    """PSNR computed only over the pixels where ``mask`` is nonzero.
+
+    ``ref`` and ``dist`` are ``(H, W, C)`` images (uint8 or float in [0, 255]).
+    ``mask`` is a ``(H, W)`` or ``(H, W, 1)`` binary map. Returns ``99.99`` when
+    the mask is empty or the masked MSE is zero.
+    """
+    ref = np.asarray(ref).astype(np.float64)
+    dist = np.asarray(dist).astype(np.float64)
+    mask = (np.asarray(mask) > 0).astype(np.float64)
+    if mask.ndim == 2:
+        mask = mask[..., None]
+    denom = mask.sum() * ref.shape[2]
+    if denom == 0:
+        return 99.99
+    mse = float(np.sum(((ref - dist) ** 2) * mask) / denom)
+    if mse == 0.0:
+        return 99.99
+    return float(np.clip(10.0 * np.log10(255.0 ** 2 / mse), 0.0, 99.99))
+
+
+def bbox_from_mask(mask):
+    """Return the inclusive ``(rmin, rmax, cmin, cmax)`` bounding box, or None."""
+    mask = np.asarray(mask) > 0
+    if not mask.any():
+        return None
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    rmin = int(np.argmax(rows))
+    rmax = int(len(rows) - 1 - np.argmax(rows[::-1]))
+    cmin = int(np.argmax(cols))
+    cmax = int(len(cols) - 1 - np.argmax(cols[::-1]))
+    return (rmin, rmax, cmin, cmax)
+
+
+def msssim_bbox(ref, dist, mask):
+    """MS-SSIM over the mask bounding box; full-frame fallback for small crops.
+
+    MS-SSIM window statistics are ill-defined on scattered pixels, so this
+    crops to the mask bounding box. If either crop side is below 32 px it falls
+    back to full-frame MS-SSIM. Returns None when the mask is empty.
+    """
+    bbox = bbox_from_mask(mask)
+    if bbox is None:
+        return None
+    rmin, rmax, cmin, cmax = bbox
+    ref = np.asarray(ref)
+    dist = np.asarray(dist)
+    crop_ref = ref[rmin:rmax + 1, cmin:cmax + 1]
+    crop_dist = dist[rmin:rmax + 1, cmin:cmax + 1]
+    if crop_ref.shape[0] < 32 or crop_ref.shape[1] < 32:
+        return float(msssim(ref, dist))
+    return float(msssim(crop_ref, crop_dist))
+
+
+def _vgg_activations(x, device):
+    """Return the ``VGG_LAYERS`` activations of an already-normalized batch."""
+    feats = _get_vgg_features(device)
+    out = {}
+    for idx, module in enumerate(feats):
+        x = module(x)
+        if isinstance(module, torch.nn.ReLU):
+            for name, relu_idx in _VGG_RELU_INDICES.items():
+                if idx == relu_idx:
+                    out[name] = x
+    return out
+
+
+def _normalize_imagenet(x, device):
+    mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
+def vgg_reference_acts(ref, device=None):
+    """Precompute reference VGG activations once for reuse across steps.
+
+    Returns the ``VGG_LAYERS`` activation dict, or None when torch is absent.
+    """
+    if torch is None:
+        return None
+    device = _resolve_device(device)
+    with torch.no_grad():
+        ref = torch.as_tensor(ref, dtype=torch.float32, device=device)
+        if ref.ndim == 3:
+            ref = ref.unsqueeze(0)
+        if ref.shape[1] == 1:
+            ref = ref.repeat(1, 3, 1, 1)
+        ref = _normalize_imagenet(ref, device)
+        return _vgg_activations(ref, device)
+
+
+def lpips_roi(ref, dist, mask, device=None, ref_acts=None):
+    """ROI-weighted perceptual distance in VGG feature space. None if no torch.
+
+    ``ref`` and ``dist`` are RGB images in [0, 1] of shape ``(C, H, W)`` (or
+    ``(1, C, H, W)``). ``mask`` is a ``(H, W)`` binary map weighted over each
+    feature scale. Mirrors the training-time weighted LPIPS.
+
+    Pass ``ref_acts`` from :func:`vgg_reference_acts` to avoid recomputing the
+    reference VGG forward pass for every progressive step.
+    """
+    if torch is None:
+        return None
+    device = _resolve_device(device)
+    with torch.no_grad():
+        dist = torch.as_tensor(dist, dtype=torch.float32, device=device)
+        mask = torch.as_tensor(mask, dtype=torch.float32, device=device)
+        if dist.ndim == 3:
+            dist = dist.unsqueeze(0)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        if dist.shape[1] == 1:
+            dist = dist.repeat(1, 3, 1, 1)
+        dist = _normalize_imagenet(dist, device)
+
+        if ref_acts is None:
+            ref_acts = vgg_reference_acts(ref, device=device)
+        a_dist = _vgg_activations(dist, device)
+
+        total = 0.0
+        for layer in _VGG_LAYERS:
+            d = (ref_acts[layer] - a_dist[layer]).norm(2, dim=1, keepdim=True)
+            w = F.adaptive_avg_pool2d(mask, (d.size(2), d.size(3)))
+            total = total + float((d * w).mean())
     return total / len(_VGG_LAYERS)

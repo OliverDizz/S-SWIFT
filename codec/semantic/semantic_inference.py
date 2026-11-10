@@ -33,14 +33,14 @@ from util import eval_forward, get_models, set_eval
 
 import network
 
-DATASET, SEQ = "uvg", "Jockey"
-ABLATION = "B"
+DATASET, SEQ = "derf", "silent"
+ABLATION = "C"
 LEVELS = [0]
 CHECKPOINT_ITER = None
 OUTPUT_FPS = 10
 WRITE_GRID = True
 SAVE_PNG = False
-COMPUTE_MSSSIM = False   # MS-SSIM is slow at 1080p; enable on short clips
+COMPUTE_MSSSIM = True   # MS-SSIM is slow at 1080p; enable on short clips
 METRIC_STRIDE = 1        # compute PSNR every Nth frame
 MSSSIM_STRIDE = 50       # compute MS-SSIM every Nth metric frame
 

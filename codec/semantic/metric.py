@@ -187,13 +187,27 @@ def MultiScaleSSIM(img1,
             (mssim[levels - 1]**weights[levels - 1]))
 
 
+def _legacy_crop(arr):
+    """Crop the height and width dimensions only, preserving any batch dim.
+
+    The legacy demo code crops to 1080p-like ``1072 x 1920``. For a batched
+    ``(N, H, W, C)`` array this must crop H and W, not N and H.
+    """
+    if arr.ndim == 4:
+        return arr[:, :1072, :1920, :]
+    if arr.ndim == 3:
+        return arr[:1072, :1920, :]
+    return arr
+
+
 def msssim(original, compared):
     if isinstance(original, str):
         original = np.array(Image.open(original).convert('RGB'))
     if isinstance(compared, str):
         compared = np.array(Image.open(compared).convert('RGB'))
 
-    original = original[:1072, :1920]
+    original = _legacy_crop(np.asarray(original))
+    compared = _legacy_crop(np.asarray(compared))
 
     original = original[None, ...] if original.ndim == 3 else original
     compared = compared[None, ...] if compared.ndim == 3 else compared
@@ -207,17 +221,13 @@ def psnr(original, compared):
     if isinstance(compared, str):
         compared = np.array(Image.open(compared).convert('RGB'))
 
-    original = original[:1072, :1920]
+    original = _legacy_crop(np.asarray(original)).astype(np.float64)
+    compared = _legacy_crop(np.asarray(compared)).astype(np.float64)
 
-    mse = np.mean(np.square(original - compared))
-    try:
-      psnr = np.clip(
-          np.multiply(np.log10(255. * 255. / mse[mse > 0.]), 10.), 0., 99.99)[0]
-    except:
-      print('PSNR error')
-      print(mse)
-      return 99.99
-    return psnr
+    mse = float(np.mean((original - compared) ** 2))
+    if mse == 0.0:
+        return 99.99
+    return float(np.clip(10.0 * np.log10(255.0 * 255.0 / mse), 0.0, 99.99))
 
 
 def main():

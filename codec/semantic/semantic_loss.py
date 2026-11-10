@@ -60,6 +60,100 @@ def weighted_l1(x, y, W):
     return diff.mean()
 
 
+def masked_l1(x, y, mask, eps=1e-8):
+    """Masked mean absolute error over the batch.
+
+    ``mask`` is a ``(B, 1, H, W)`` weight map broadcast over the channel
+    dimension of ``x``/``y`` (which have ``C`` channels). Returns a scalar:
+    ``sum(|x - y| * mask) / (sum(mask) * C + eps)``.
+    """
+    diff = (x - y).abs()
+    num = (diff * mask).sum()
+    den = mask.sum() * x.size(1) + eps
+    return num / den
+
+
+def build_roi_map(S, boundary_band=0, boundary_weight=0.5):
+    """Return a boundary-aware ROI map from the binary mask ``S``.
+
+    With ``boundary_band <= 0`` this is just ``S``. Otherwise the ROI interior
+    keeps weight 1 and a max-pool dilated ring around the ROI (the boundary
+    band) gets an extra ``boundary_weight``. The dilation is a max pool with
+    kernel ``2 * band + 1``, stride 1, and same padding, so no SciPy dependency
+    is needed.
+    """
+    if S is None:
+        return None
+    if boundary_band <= 0:
+        return S
+    kernel = 2 * boundary_band + 1
+    padding = boundary_band
+    dilated = F.max_pool2d(S, kernel_size=kernel, stride=1, padding=padding)
+    dilated = (dilated > 0.0).to(S.dtype)
+    band = torch.clamp(dilated - S, min=0.0)
+    return S + boundary_weight * band
+
+
+def ramp_multipliers(step_idx, num_steps, roi_ramp='none', roi_ramp_start=0.5):
+    """Return ``(roi_mult, bg_mult)`` for a progressive ROI-emphasis ramp.
+
+    With ``roi_ramp == 'linear'`` the ROI weight scales from
+    ``roi_ramp_start`` at step 1 to ``1.0`` at step ``num_steps``, and the
+    background weight scales inversely. ``none`` keeps both constant.
+    """
+    if roi_ramp != 'linear' or num_steps <= 1:
+        return 1.0, 1.0
+    t = float(step_idx) / float(num_steps - 1)
+    roi_mult = roi_ramp_start + (1.0 - roi_ramp_start) * t
+    bg_mult = 1.0 + (1.0 - roi_ramp_start) * (1.0 - t)
+    return roi_mult, bg_mult
+
+
+def region_l1(recon, target, S, E, roi_map,
+              roi_weight=2.0, bg_weight=0.5, edge_weight=0.5,
+              roi_mult=1.0, bg_mult=1.0, eps=1e-8):
+    """Per-sample region loss with a legacy fallback for empty masks.
+
+    Returns ``(scalar_loss, roi, bg, edge, fallback_count)``. ``scalar_loss`` is
+    a differentiable tensor. ``roi``/``bg``/``edge`` are detached scalar tensors
+    and ``fallback_count`` is a tensor; callers accumulate them and convert to
+    Python numbers only at logging time, so the training loop does not force a
+    GPU sync on every progressive step.
+    """
+    diff = (recon - target).abs()
+    channels = recon.size(1)
+
+    def masked_mean(mask):
+        num = (diff * mask).sum(dim=(1, 2, 3))
+        den = mask.sum(dim=(1, 2, 3)) * channels + eps
+        return num / den
+
+    legacy = diff.mean(dim=(1, 2, 3))
+
+    if S is None:
+        return legacy.mean(), torch.zeros(()), torch.zeros(()), torch.zeros(()), torch.zeros((), dtype=torch.long)
+
+    roi = masked_mean(roi_map) if roi_map is not None else masked_mean(S)
+    bg = masked_mean(1.0 - S)
+    if E is not None:
+        edge = masked_mean(E)
+    else:
+        edge = torch.zeros_like(roi)
+
+    region = (roi_weight * roi_mult * roi
+              + bg_weight * bg_mult * bg
+              + edge_weight * edge)
+
+    has_mask = S.sum(dim=(1, 2, 3)) > 0
+    combined = torch.where(has_mask, region, legacy)
+
+    return (combined.mean(),
+            roi.detach().mean(),
+            bg.detach().mean(),
+            edge.detach().mean(),
+            (~has_mask).sum().detach())
+
+
 def _vgg_features(device=None):
     """Lazily build a (cached) VGG16 feature extractor for the perceptual term."""
     key = str(device) if device is not None else 'cpu'

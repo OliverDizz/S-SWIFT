@@ -212,34 +212,64 @@ them with `np.packbits` and `np.savez_compressed`. Evaluation reports their cost
 as bytes per frame. `mask_iou()` and `edge_f1()` in `semantic_metrics.py` are
 placeholders and are not used yet.
 
-The visual loss is weighted by
+The visual loss has two modes selected by `--loss-mode`:
 
-```text
-W = 1 + alpha_sem * S + alpha_edge * E
-```
+- `legacy` (default) weights the loss by
 
-normalized to mean 1 per sample. `--alpha-sem` defaults to 1.0 and
-`--alpha-edge` to 0.5. With no mask or edge input, `W` is all ones, so the loss
-matches the baseline.
+  ```text
+  W = 1 + alpha_sem * S + alpha_edge * E
+  ```
 
-`--use-conditioning` adds `MaskAdd` in the encoder and `FiLM` modulation in
-`DecoderCell` and `DecoderCell2` at the four pixel-shuffle scales. These modules
-read `(S, E)` and do not change the input channels of existing layers. The new
-heads are randomly initialized. `train.py` uses a strict `load_state_dict`, so a
-conditioned model cannot resume from an A/B checkpoint. Train C from scratch.
+  normalized to mean 1 per sample. `--alpha-sem` defaults to 1.0 and
+  `--alpha-edge` to 0.5. With no mask or edge input, `W` is all ones, so the
+  loss matches the baseline.
+- `region` replaces `W` with an explicit ROI/background/edge loss per
+  progressive step:
+
+  ```text
+  L = roi_weight  * masked_l1(recon, target, roi_map)
+    + bg_weight   * masked_l1(recon, target, 1 - S)
+    + edge_weight * masked_l1(recon, target, E)
+    + lpips_weight * lpips(...)
+  ```
+
+  where `masked_l1` uses masked means (`sum(|x-y| * m) / (sum(m) * C + eps)`).
+  `--roi-weight` (2.0), `--bg-weight` (0.5), and `--edge-weight` (0.5) set the
+  term weights. `--boundary-band` (>0) boosts a max-pool dilated boundary ring
+  around the ROI by `--boundary-weight`. `--roi-ramp linear` ramps the ROI
+  weight from `--roi-ramp-start` at step 1 to `1.0` at step N. Empty masks
+  fall back to the legacy term for that sample and the count is logged.
+  `--lpips-scope` (`full`/`roi`) and `--lpips-steps` (`final`/`last3`/`all`)
+  control the LPIPS term; `last3` avoids the final-only objective that caused
+  the step-10 PSNR collapse.
+
+`--use-conditioning` adds conditioning that reads `(S, E)` and does not change
+the input channels of existing layers. `--conditioning-mode legacy` uses a
+pooled `FiLM` at the four pixel-shuffle scales of `DecoderCell`/`DecoderCell2`
+plus a `MaskAdd` branch in the encoder. `--conditioning-mode spatial` uses
+`SpatialFiLM`, which pools the semantic map to the feature resolution (not
+`(1,1)`) so the modulation varies across space. `--conditioning-init zero`
+zero-initializes the new heads so the module is the identity at start.
 
 The ablation ladder is:
 
-- **A**: baseline copy, no mask or edge arguments.
-- **B**: weighted loss (`--train-mask`, `--eval-mask`, `--train-edge`,
-  `--eval-edge`, `--alpha-sem`, `--alpha-edge`). The architecture is unchanged,
-  so B is checkpoint-compatible with A.
-- **C**: B plus `--use-conditioning`.
+- **A**: baseline copy, no mask or edge arguments, legacy loss, no LPIPS.
+- **B**: region loss (`--loss-mode region`). The architecture is unchanged, so
+  B is checkpoint-compatible with A.
+- **C**: B plus spatial conditioning (`--use-conditioning`,
+  `--conditioning-mode spatial`, `--conditioning-init zero`).
 
 A uses the baseline loss from `codec/src`. The notebook never adds
-`--use-wlpips` to A. For B and C, `USE_WLPIPS` controls the weighted LPIPS
-term and it is on by default. Set `USE_WLPIPS = False` to train B and C
-without it.
+`--use-wlpips` to A. For B and C, `USE_WLPIPS` controls the weighted LPIPS term.
+The notebook sets `LPIPS_SCOPE=roi` and `LPIPS_STEPS=last3` for B/C, and
+`BEST_METRIC=mean` so the best checkpoint is selected by mean PSNR over steps
+instead of the anomalous final step.
+
+Warm start: C starts from B, not from scratch. Point `--load-model-dir` at B's
+`model/` directory and load with `--load-strict false`. Shared weights load and
+new conditioning keys keep their zero init, so C starts identical to B. A
+single-run resume (same `--model-dir`) still uses strict loading via
+`--load-model-name`/`--load-iter`.
 
 The semantic notebook reads these paths:
 
@@ -253,12 +283,20 @@ data/kinetics/train_edges|test_edges/<clip>/frame_%04d.png
 derf and UVG use `data/<dataset>/{frames,mv,masks,edges}/<seq>/`. Use `data/`,
 not `data_old/` or the original authors' paths.
 
-The new modules are `semantic_loss.py` (weighted L1 and weighted LPIPS),
-`conditioning.py` (`MaskAdd` and `FiLM`), `mask_codec.py` (lossless mask/edge
-bytes), and `semantic_metrics.py` (VMAF, LPIPS, and unused IoU/F1 helpers).
-`--use-wlpips` adds a VGG16 feature-space LPIPS term to training.
-`--use-vmaf` and `--use-lpips` add eval-only metrics and are best-effort. They
-return `None` or print nothing when the optional backend is missing.
+The new modules are `semantic_loss.py` (weighted L1/LPIPS and the region loss),
+`conditioning.py` (`MaskAdd`, `FiLM`, and `SpatialFiLM`), `mask_codec.py`
+(lossless mask/edge bytes), and `semantic_metrics.py` (VMAF, LPIPS, and the ROI
+metrics `psnr_masked`, `bbox_from_mask`, `msssim_bbox`, `lpips_roi`; IoU/F1 are
+still placeholders). `--use-wlpips` adds a VGG16 feature-space LPIPS term to
+training. `--use-vmaf` and `--use-lpips` add eval-only metrics and are
+best-effort. They return `None` or print nothing when the optional backend is
+missing.
+
+Evaluation reports ROI-masked PSNR, background PSNR, bbox MS-SSIM, ROI LPIPS,
+and `total_bytes_per_frame` (mask + edge + visual code bytes) in addition to
+the full-frame metrics. A run with all-zero masks (ablation A) skips the ROI
+metrics and reports them as `None`. `--best-metric` (`last`/`mean`/`max`) picks
+the checkpoint PSNR criterion; new B/C runs use `mean`.
 
 Do not modify or vendor `external/sam3`. Treat it as an external dependency.
 
@@ -301,8 +339,12 @@ notebook does these steps:
 3. Runs the mask/edge inspection cell. Run this cell before a long training.
 4. Builds and checks the train and eval datasets for each hierarchy level.
 5. Launches `codec/semantic/train.py` with `torchrun` and DDP, one cell per run.
-6. Writes logs, TensorBoard events, checkpoints, and evaluation outputs under
-   `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/`.
+6. Writes logs, TensorBoard events, checkpoints, and evaluation outputs under a
+   new timestamped run directory
+   `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/<YYYYmmdd_HHMMSS>/`.
+   Each `run_training` call gets its own timestamped folder, so re-runs do not
+   overwrite earlier results. Set `RUN_TAG` to pin a fixed folder, or pass
+   `EVAL_RUN_TAG`/`SUMMARY_RUN_TAG` to evaluate an earlier run.
 7. Loads a saved checkpoint and runs standalone evaluation. The evaluation cell
    uses `EVAL_ABLATION` to select the ablation.
 
@@ -341,11 +383,11 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 - `RESUME_FROM` continues a level from a saved checkpoint.
 - `latest_iteration()` ignores `*_best.pth` files.
 - The semantic notebook writes `train.log`, `hierarchy<level>_<net>_<iter>.pth`,
-  TensorBoard events, packed codes, and probe images under
-  `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/`.
-- Each semantic ablation has its own `model/`, `output/`, `tensorboard/`, and
-  `train.log` subtree. A/B/C runs do not overwrite each other. The checkpoint
-  prefix stays `hierarchy<level>`.
+  TensorBoard events, packed codes, and probe images under a timestamped run
+  directory `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/<run_tag>/`.
+- Each semantic ablation and each run has its own `model/`, `output/`,
+  `tensorboard/`, and `train.log` subtree. A/B/C runs and repeat runs do not
+  overwrite each other. The checkpoint prefix stays `hierarchy<level>`.
 - In the semantic notebook, `--save-codes` writes packed code files under
   `output/<suffix>/codes/`. `--save-out-img` is accepted, but `evaluate.py` does
   not dump per-frame images. Evaluation always writes one probe frame per run
@@ -539,8 +581,10 @@ take the argmax. Therefore test results are stochastic.
   `codec/semantic/`.
 - Preserve semantic checkpoint compatibility when you change the architecture.
   A and B share the same state-dict keys. C adds `mask_add` and `film*` keys, and
-  strict resume fails across the A/B-to-C boundary. Warm-start A/B from a
-  compatible checkpoint, but train C from scratch.
+  strict resume fails across the A/B-to-C boundary. Warm-start C from B with
+  `--load-model-dir` (B's `model/`) and `--load-strict false`; the new
+  conditioning keys are zero-initialized via `--conditioning-init zero`, so C
+  starts identical to B.
 - Do not commit `codec/semantic/experiments/`, checkpoints, logs, TensorBoard
   events, packed `.codes` files, or probe images.
 - `codec/semantic/train.sh` and `codec/semantic/train_kinetics.sh` are legacy
@@ -567,7 +611,9 @@ take the argmax. Therefore test results are stochastic.
     checkpoint.
   - For the semantic codec, compile the changed modules and run the notebook with
     `QUICK_TEST = True` on level 0. Run the mask/edge inspection cell first. Check
-    the loss lines, the mask and edge byte counts, and the best checkpoint.
+    the loss lines, the mask and edge byte counts, the ROI scalars, and the best
+    checkpoint. Run the lightweight unit tests with
+    `python -m unittest tests.test_semantic -v` from `codec/semantic/`.
   - For the streamer, run a short `test_grad.py` call against one trace. Then check the
     logs and the reward.
 - Use `python`, not `python3`, only when the configured `python_path` points there.

@@ -31,7 +31,9 @@ def get_models(args, v_compress, bits, encoder_fuse_level, decoder_fuse_level):
         stack=args.stack,
         fuse_encoder=args.fuse_encoder,
         fuse_level=encoder_fuse_level,
-        use_conditioning=args.use_conditioning
+        use_conditioning=args.use_conditioning,
+        conditioning_mode=getattr(args, 'conditioning_mode', 'legacy'),
+        conditioning_init=getattr(args, 'conditioning_init', 'random')
     ).cuda()
 
     binarizer = network.Binarizer(bits).cuda()
@@ -40,7 +42,9 @@ def get_models(args, v_compress, bits, encoder_fuse_level, decoder_fuse_level):
         v_compress=v_compress, shrink=args.shrink,
         bits=bits,
         fuse_level=decoder_fuse_level,
-        use_conditioning=args.use_conditioning
+        use_conditioning=args.use_conditioning,
+        conditioning_mode=getattr(args, 'conditioning_mode', 'legacy'),
+        conditioning_init=getattr(args, 'conditioning_init', 'random')
     ).cuda()
 
     if v_compress:
@@ -281,6 +285,7 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
             dec_unet_output2[jj] = None
 
     codes = []
+    final_codes = None
     prev_psnr = 0.0
     #code_arr=[]
 
@@ -324,8 +329,14 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
         (output_d2, out_ee1, out_ee2, out_ee3, out_ee4, d2_h_1, d2_h_2, d2_h_3, d2_h_4) = d2(
                 code_d2, d2_h_1, d2_h_2, d2_h_3, d2_h_4,
                 dec_unet_output1, dec_unet_output2, sem)
+        if args.save_codes or i == iterations - 1:
+            cpu_codes = code_d2.data.cpu().numpy()
+        else:
+            cpu_codes = None
         if args.save_codes:
-            codes.append(code_d2.data.cpu().numpy())
+            codes.append(cpu_codes)
+        if i == iterations - 1:
+            final_codes = cpu_codes
 
         out_img_new = out_img + output_d2.data.cpu()
         out_img_np = out_img_new.numpy().clip(0, 1)
@@ -337,7 +348,14 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
         out_imgs_ee3.append((out_img + out_ee3.data.cpu()).numpy().clip(0, 1))
         out_imgs_ee4.append((out_img + out_ee4.data.cpu()).numpy().clip(0, 1))
 
-    return original, np.array(out_imgs), np.array(out_imgs_ee1), np.array(out_imgs_ee2), np.array(out_imgs_ee3), np.array(out_imgs_ee4), np.array(losses), np.array(codes)
+    if args.save_codes:
+        code_output = np.array(codes)
+    elif final_codes is not None:
+        code_output = np.array([final_codes])
+    else:
+        code_output = np.array([])
+
+    return original, np.array(out_imgs), np.array(out_imgs_ee1), np.array(out_imgs_ee2), np.array(out_imgs_ee3), np.array(out_imgs_ee4), np.array(losses), code_output
 
 
 def save_numpy_array_as_image(filename, arr):

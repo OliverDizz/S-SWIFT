@@ -18,6 +18,7 @@ from train_options import parser
 from util import get_models, init_lstm, set_train, set_eval, init_d2
 from util import prepare_inputs, forward_ctx
 from semantic_loss import build_weight_map, weighted_l1, weighted_lpips
+from semantic_loss import build_roi_map, region_l1, ramp_multipliers
 
 import network
 
@@ -114,7 +115,9 @@ def main():
     d2 = network.DecoderCell2(
         v_compress=args.v_compress, shrink=args.shrink,
         bits=args.bits, fuse_level=args.decoder_fuse_level,
-        use_conditioning=args.use_conditioning).cuda()
+        use_conditioning=args.use_conditioning,
+        conditioning_mode=getattr(args, 'conditioning_mode', 'legacy'),
+        conditioning_init=getattr(args, 'conditioning_init', 'random')).cuda()
 
     nets = [encoder, binarizer, decoder, d2]
     if unet is not None:
@@ -153,17 +156,24 @@ def main():
             return net.module
         return net
 
-    def resume(model_name, index):
+    def resume(model_name, index, model_dir=None, strict=True):
+        model_dir = model_dir or args.model_dir
         for net_idx, net in enumerate(nets):
             if net is None:
                 continue
             name = names[net_idx]
             checkpoint_path = '{}/{}_{}_{:08d}.pth'.format(
-                args.model_dir, model_name, name, index)
+                model_dir, model_name, name, index)
             if rank == 0:
-                print('Loading %s from %s...' % (name, checkpoint_path))
-            unwrap(net).load_state_dict(
-                torch.load(checkpoint_path, map_location='cuda:%d' % local_rank))
+                print('Loading %s from %s (strict=%s)...' % (name, checkpoint_path, strict))
+            state = torch.load(checkpoint_path, map_location='cuda:%d' % local_rank)
+            if strict:
+                unwrap(net).load_state_dict(state)
+            else:
+                missing, unexpected = unwrap(net).load_state_dict(state, strict=False)
+                if rank == 0:
+                    print('  missing keys (kept at init): %d' % len(missing))
+                    print('  unexpected keys (ignored): %d' % len(unexpected))
 
     def save_as(suffix):
         for net_idx, net in enumerate(nets):
@@ -184,10 +194,19 @@ def main():
 
     train_iter = 0
     just_resumed = False
-    if args.load_model_name:
+    if args.load_model_dir:
+        # Warm start from a different model directory (e.g. C from B). Load the
+        # shared weights with strict=False so new conditioning keys keep their
+        # zero/random init, and start a fresh training run from iteration 0.
+        if rank == 0:
+            print('Warm start from %s@iter %s (strict=%s)' % (
+                args.load_model_dir, args.load_iter, args.load_strict))
+        resume(args.load_model_name, args.load_iter, args.load_model_dir,
+               strict=(args.load_strict == 'true'))
+    elif args.load_model_name:
         if rank == 0:
             print('Loading %s@iter %d' % (args.load_model_name, args.load_iter))
-        resume(args.load_model_name, args.load_iter)
+        resume(args.load_model_name, args.load_iter, strict=True)
         train_iter = args.load_iter
         scheduler.last_epoch = train_iter
         just_resumed = True
@@ -230,10 +249,41 @@ def main():
             if args.use_conditioning and S is not None and E is not None:
                 sem = torch.cat([S, E], dim=1)
 
+            is_region = args.loss_mode == 'region'
+
             W = None
+            roi_map = None
             if S is not None or E is not None:
-                W = build_weight_map(
-                    S, E, args.alpha_sem, args.alpha_edge)
+                if is_region:
+                    roi_map = build_roi_map(
+                        S, args.boundary_band, args.boundary_weight)
+                else:
+                    W = build_weight_map(
+                        S, E, args.alpha_sem, args.alpha_edge)
+
+            lpips_W = None
+            lpips_steps = 'final'
+            if args.use_wlpips:
+                if is_region:
+                    lpips_W = roi_map if args.lpips_scope == 'roi' else None
+                    lpips_steps = args.lpips_steps
+                else:
+                    lpips_W = W
+
+            region_roi_sum = 0.0
+            region_bg_sum = 0.0
+            region_edge_sum = 0.0
+            region_fallback = 0
+            region_terms = 0
+            d2_outputs = []
+
+            def region_term(recon, target, step_idx):
+                roi_mult, bg_mult = ramp_multipliers(
+                    step_idx, args.iterations, args.roi_ramp, args.roi_ramp_start)
+                return region_l1(
+                    recon, target, S, E, roi_map,
+                    args.roi_weight, args.bg_weight, args.edge_weight,
+                    roi_mult, bg_mult)
 
             losses = []
             rec2_losses = []
@@ -266,7 +316,17 @@ def main():
 
                 res = res - output
                 out_img = out_img + output.data
-                losses.append(weighted_l1(res, 0.0, W))
+
+                if is_region:
+                    scalar, c_roi, c_bg, c_edge, c_fb = region_term(res, 0.0, i)
+                    losses.append(scalar)
+                    region_roi_sum += c_roi
+                    region_bg_sum += c_bg
+                    region_edge_sum += c_edge
+                    region_fallback += c_fb
+                    region_terms += 1
+                else:
+                    losses.append(weighted_l1(res, 0.0, W))
 
                 (d2_h_1, d2_h_2, d2_h_3, d2_h_4) = init_d2(
                     batch_size=(crops[0].size(0) * args.num_crops),
@@ -278,11 +338,55 @@ def main():
                      codes_d2, d2_h_1, d2_h_2, d2_h_3, d2_h_4,
                      warped_unet_output1, warped_unet_output2, sem)
 
-                rec2_losses.append(weighted_l1(in_img, output_d2, W))
-                ee1_losses.append(weighted_l1(in_img, out_ee1, W))
-                ee2_losses.append(weighted_l1(in_img, out_ee2, W))
-                ee3_losses.append(weighted_l1(in_img, out_ee3, W))
-                ee4_losses.append(weighted_l1(in_img, out_ee4, W))
+                if is_region:
+                    scalar, c_roi, c_bg, c_edge, c_fb = region_term(in_img, output_d2, i)
+                    rec2_losses.append(scalar)
+                    region_roi_sum += c_roi
+                    region_bg_sum += c_bg
+                    region_edge_sum += c_edge
+                    region_fallback += c_fb
+                    region_terms += 1
+
+                    scalar, c_roi, c_bg, c_edge, c_fb = region_term(in_img, out_ee1, i)
+                    ee1_losses.append(scalar)
+                    region_roi_sum += c_roi
+                    region_bg_sum += c_bg
+                    region_edge_sum += c_edge
+                    region_fallback += c_fb
+                    region_terms += 1
+
+                    scalar, c_roi, c_bg, c_edge, c_fb = region_term(in_img, out_ee2, i)
+                    ee2_losses.append(scalar)
+                    region_roi_sum += c_roi
+                    region_bg_sum += c_bg
+                    region_edge_sum += c_edge
+                    region_fallback += c_fb
+                    region_terms += 1
+
+                    scalar, c_roi, c_bg, c_edge, c_fb = region_term(in_img, out_ee3, i)
+                    ee3_losses.append(scalar)
+                    region_roi_sum += c_roi
+                    region_bg_sum += c_bg
+                    region_edge_sum += c_edge
+                    region_fallback += c_fb
+                    region_terms += 1
+
+                    scalar, c_roi, c_bg, c_edge, c_fb = region_term(in_img, out_ee4, i)
+                    ee4_losses.append(scalar)
+                    region_roi_sum += c_roi
+                    region_bg_sum += c_bg
+                    region_edge_sum += c_edge
+                    region_fallback += c_fb
+                    region_terms += 1
+                else:
+                    rec2_losses.append(weighted_l1(in_img, output_d2, W))
+                    ee1_losses.append(weighted_l1(in_img, out_ee1, W))
+                    ee2_losses.append(weighted_l1(in_img, out_ee2, W))
+                    ee3_losses.append(weighted_l1(in_img, out_ee3, W))
+                    ee4_losses.append(weighted_l1(in_img, out_ee4, W))
+
+                if args.use_wlpips and lpips_steps != 'final':
+                    d2_outputs.append(output_d2 + 0.5)
 
             bp_t1 = time.time()
 
@@ -293,9 +397,20 @@ def main():
             ee3_loss = sum(ee3_losses) / args.iterations
             ee4_loss = sum(ee4_losses) / args.iterations
             loss = (rec1_loss + rec2_loss) * 0.5 + (ee1_loss + ee2_loss + ee3_loss + ee4_loss) * 0.25
+            lpips_value = 0.0
             if args.use_wlpips:
-                loss = loss + weighted_lpips(
-                    in_img + 0.5, output_d2 + 0.5, W, args.lpips_weight)
+                if lpips_steps == 'final':
+                    lpips_value = weighted_lpips(
+                        in_img + 0.5, output_d2 + 0.5, lpips_W, args.lpips_weight)
+                else:
+                    if lpips_steps == 'last3':
+                        selected = d2_outputs[-3:]
+                    else:
+                        selected = d2_outputs
+                    lpips_value = sum(
+                        weighted_lpips(in_img + 0.5, o, lpips_W, args.lpips_weight)
+                        for o in selected) / len(selected)
+                loss = loss + lpips_value
             loss.backward()
 
             for net in [encoder, binarizer, decoder, unet, d2]:
@@ -327,6 +442,28 @@ def main():
                 log_scalar('train/lr', lr_value, train_iter)
                 log_scalar('train/backprop_sec', bp_t1 - bp_t0, train_iter)
                 log_scalar('train/batch_sec', batch_t1 - batch_t0, train_iter)
+
+                if args.use_wlpips:
+                    log_scalar('train/lpips', float(lpips_value), train_iter)
+
+                if is_region:
+                    term_count = max(region_terms, 1)
+                    log_scalar('train/loss_roi', float(region_roi_sum / term_count), train_iter)
+                    log_scalar('train/loss_bg', float(region_bg_sum / term_count), train_iter)
+                    log_scalar('train/loss_edge', float(region_edge_sum / term_count), train_iter)
+                    if S is not None:
+                        log_scalar('train/roi_density', float(S.mean()), train_iter)
+                    if E is not None:
+                        log_scalar('train/edge_density', float(E.mean()), train_iter)
+                    if S is not None:
+                        effective = args.roi_weight * roi_map + args.bg_weight * (1.0 - S)
+                        if E is not None:
+                            effective = effective + args.edge_weight * E
+                        log_scalar('train/effective_weight_mean', float(effective.mean()), train_iter)
+                        log_scalar('train/effective_weight_max', float(effective.max()), train_iter)
+                    fallback_count = int(region_fallback)
+                    if fallback_count:
+                        log_scalar('train/empty_mask_fallback', float(fallback_count), train_iter)
 
                 if writer is not None:
                     memory = get_memory_gb()
@@ -366,24 +503,36 @@ def main():
 
                 for eval_name, eval_loader in eval_loaders.items():
                     eval_begin = time.time()
-                    (eval_loss, mssim, psnr,
-                     psnr_ee1, psnr_ee2, psnr_ee3, psnr_ee4,
-                     mask_bitrate, edge_bitrate, vmaf_mean, lpips_mean) = run_eval(
+                    result = run_eval(
                         nets, eval_loader, eval_args,
                         output_suffix='iter%d' % train_iter,
                         writer=writer, global_step=train_iter,
                         tag_prefix='eval/%s' % eval_name)
 
                     if world_size > 1:
-                        eval_loss = _all_reduce_mean(eval_loss)
-                        mssim = _all_reduce_mean(mssim)
-                        psnr = _all_reduce_mean(psnr)
-                        psnr_ee1 = _all_reduce_mean(psnr_ee1)
-                        psnr_ee2 = _all_reduce_mean(psnr_ee2)
-                        psnr_ee3 = _all_reduce_mean(psnr_ee3)
-                        psnr_ee4 = _all_reduce_mean(psnr_ee4)
-                        mask_bitrate = _all_reduce_mean(mask_bitrate)
-                        edge_bitrate = _all_reduce_mean(edge_bitrate)
+                        reduced = {}
+                        for field in result._fields:
+                            reduced[field] = _all_reduce_mean(getattr(result, field))
+                        result = type(result)(**reduced)
+
+                    eval_loss = result.loss
+                    mssim = result.msssim
+                    psnr = result.psnr
+                    psnr_ee1 = result.psnr_ee1
+                    psnr_ee2 = result.psnr_ee2
+                    psnr_ee3 = result.psnr_ee3
+                    psnr_ee4 = result.psnr_ee4
+                    psnr_roi = result.psnr_roi
+                    psnr_bg = result.psnr_bg
+                    msssim_bbox = result.msssim_bbox
+                    lpips_roi = result.lpips_roi
+                    mask_bitrate = result.mask_bytes
+                    edge_bitrate = result.edge_bytes
+                    mask_iou = result.mask_iou
+                    edge_f1 = result.edge_f1
+                    total_bytes = result.total_bytes_per_frame
+                    vmaf_mean = result.vmaf
+                    lpips_mean = result.lpips
 
                     if rank == 0:
                         print('Evaluation @iter %d done in %d secs' % (
@@ -402,10 +551,18 @@ def main():
                               + '\t'.join(['%.5f' % el for el in psnr_ee3.tolist()]))
                         print('%s EE4 PSNR: ' % eval_name
                               + '\t'.join(['%.5f' % el for el in psnr_ee4.tolist()]))
+                        if psnr_roi is not None:
+                            print('%s ROI PSNR: ' % eval_name
+                                  + '\t'.join(['%.5f' % el for el in psnr_roi.tolist()]))
+                        if psnr_bg is not None:
+                            print('%s BG PSNR : ' % eval_name
+                                  + '\t'.join(['%.5f' % el for el in psnr_bg.tolist()]))
                         if mask_bitrate is not None:
                             print('%s Mask bytes/frame: %.2f' % (eval_name, mask_bitrate))
                         if edge_bitrate is not None:
                             print('%s Edge bytes/frame: %.2f' % (eval_name, edge_bitrate))
+                        if total_bytes is not None:
+                            print('%s Total bytes/frame: %.2f' % (eval_name, total_bytes))
                         if vmaf_mean is not None:
                             print('%s VMAF : %.4f' % (eval_name, vmaf_mean))
                         if lpips_mean is not None:
@@ -427,6 +584,18 @@ def main():
                                        float(psnr_ee3[step_idx]), train_iter)
                             log_scalar('eval/%s/psnr_ee4_step_%02d' % (eval_name, step),
                                        float(psnr_ee4[step_idx]), train_iter)
+                            if psnr_roi is not None:
+                                log_scalar('eval/%s/psnr_roi_step_%02d' % (eval_name, step),
+                                           float(psnr_roi[step_idx]), train_iter)
+                            if psnr_bg is not None:
+                                log_scalar('eval/%s/psnr_bg_step_%02d' % (eval_name, step),
+                                           float(psnr_bg[step_idx]), train_iter)
+                            if msssim_bbox is not None:
+                                log_scalar('eval/%s/msssim_bbox_step_%02d' % (eval_name, step),
+                                           float(msssim_bbox[step_idx]), train_iter)
+                            if lpips_roi is not None:
+                                log_scalar('eval/%s/lpips_roi_step_%02d' % (eval_name, step),
+                                           float(lpips_roi[step_idx]), train_iter)
 
                         log_scalar('eval/%s/loss_mean' % eval_name,
                                    float(eval_loss.mean()), train_iter)
@@ -440,6 +609,13 @@ def main():
                         if edge_bitrate is not None:
                             log_scalar('eval/%s/edge_bytes_per_frame' % eval_name,
                                        edge_bitrate, train_iter)
+                        if mask_iou is not None:
+                            log_scalar('eval/%s/mask_iou' % eval_name, mask_iou, train_iter)
+                        if edge_f1 is not None:
+                            log_scalar('eval/%s/edge_f1' % eval_name, edge_f1, train_iter)
+                        if total_bytes is not None:
+                            log_scalar('eval/%s/total_bytes_per_frame' % eval_name,
+                                       total_bytes, train_iter)
                         if vmaf_mean is not None:
                             log_scalar('eval/%s/vmaf' % eval_name,
                                        vmaf_mean, train_iter)
@@ -447,19 +623,30 @@ def main():
                             log_scalar('eval/%s/lpips' % eval_name,
                                        lpips_mean, train_iter)
 
-                    eval_psnr = float(psnr[-1])
+                    if args.best_metric == 'mean':
+                        eval_psnr = float(psnr.mean())
+                        best_step = -1
+                    elif args.best_metric == 'max':
+                        best_step = int(np.argmax(psnr))
+                        eval_psnr = float(psnr[best_step])
+                    else:
+                        best_step = len(psnr) - 1
+                        eval_psnr = float(psnr[best_step])
+
                     if eval_psnr > best_psnr:
                         best_psnr = eval_psnr
                         best_iter = train_iter
                         patience = 0
                         if rank == 0:
                             save_best()
-                            print('New best PSNR %.5f at iter %d' % (best_psnr, best_iter))
+                            print('New best PSNR %.5f at iter %d (step %s)' % (
+                                best_psnr, best_iter, best_step))
                     else:
                         patience += 1
 
                     if rank == 0:
                         log_scalar('eval/%s/best_psnr' % eval_name, best_psnr, train_iter)
+                        log_scalar('eval/%s/best_step' % eval_name, best_step, train_iter)
 
                     if args.early_stop > 0 and patience >= args.early_stop:
                         if rank == 0:
