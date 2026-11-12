@@ -4,6 +4,10 @@ Mask IoU and edge F1 are placeholders for a future lossy semantic codec (for
 the lossless v1 codec they are trivially 1.0). VMAF and LPIPS are perceptual
 metrics for the high-fidelity layer and are best-effort: they return ``None``
 when their optional dependencies are unavailable.
+
+LPIPS uses the official ``lpips`` package (AlexNet, learned linear weights) for
+both the full-frame scalar and the mask-weighted ROI variant. A non-standard
+VGG-L2 distance is retained only behind ``--use-vgg-l2`` as a diagnostic.
 """
 
 import json
@@ -24,20 +28,6 @@ except ImportError:  # pragma: no cover
 from PIL import Image
 
 from metric import msssim
-
-_VGG_RELU_INDICES = {
-    'relu1_2': 3,
-    'relu2_2': 8,
-    'relu3_3': 15,
-    'relu4_3': 22,
-    'relu5_3': 29,
-}
-_VGG_LAYERS = ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3', 'relu5_3']
-
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
-
-_vgg_cache = {}
 
 
 def _to_binary(arr):
@@ -150,26 +140,23 @@ def vmaf(ref, dist):
     return None
 
 
-def _get_vgg_features(device):
-    """Return the (cached) VGG16 feature extractor on ``device``."""
-    key = str(device)
-    feats = _vgg_cache.get(key)
-    if feats is not None:
-        return feats
-    import torchvision
-    try:
-        weights = torchvision.models.VGG16_Weights.DEFAULT
-    except AttributeError:
-        weights = None
-    try:
-        model = torchvision.models.vgg16(weights=weights)
-    except Exception:
-        model = torchvision.models.vgg16(weights=None)
-    feats = model.features.eval().to(device)
-    for p in feats.parameters():
+_lpips_cache = {}
+
+
+def _get_lpips_model(device, net='alex'):
+    """Return the (cached) official LPIPS model on ``device``."""
+    key = (str(device), net)
+    model = _lpips_cache.get(key)
+    if model is not None:
+        return model
+    import lpips as lpips_pkg
+    model = lpips_pkg.LPIPS(net=net, spatial=True)
+    model.eval()
+    for p in model.parameters():
         p.requires_grad_(False)
-    _vgg_cache[key] = feats
-    return feats
+    model = model.to(device)
+    _lpips_cache[key] = model
+    return model
 
 
 def _resolve_device(device):
@@ -184,48 +171,152 @@ def _resolve_device(device):
     return device
 
 
-def lpips(ref, dist, device=None):
-    """Perceptual distance in VGG feature space (unweighted). None if no torch.
+def _lpips_tensor(img, device):
+    """Return an RGB ``(1, 3, H, W)`` tensor scaled from [0, 1] to [-1, 1]."""
+    t = torch.as_tensor(img, dtype=torch.float32, device=device)
+    if t.ndim == 3:
+        t = t.unsqueeze(0)
+    if t.shape[1] == 1:
+        t = t.repeat(1, 3, 1, 1)
+    return (t - 0.5) * 2.0
 
-    Runs on ``device`` (the current CUDA device by default). Each image is
-    processed on its own under ``torch.no_grad()``, so peak memory stays small
-    during the in-training evaluation.
+
+def lpips(ref, dist, device=None, net='alex'):
+    """Official AlexNet LPIPS scalar. None if torch or lpips is unavailable.
+
+    ``ref`` and ``dist`` are RGB images in [0, 1] of shape ``(C, H, W)`` or
+    ``(1, C, H, W)``.
     """
     if torch is None:
         return None
     device = _resolve_device(device)
     with torch.no_grad():
-        ref = torch.as_tensor(ref, dtype=torch.float32, device=device)
-        dist = torch.as_tensor(dist, dtype=torch.float32, device=device)
-        if ref.ndim == 3:
-            ref = ref.unsqueeze(0)
-            dist = dist.unsqueeze(0)
-        if ref.shape[1] == 1:
-            ref = ref.repeat(1, 3, 1, 1)
-            dist = dist.repeat(1, 3, 1, 1)
-        feats = _get_vgg_features(device)
+        ref_t = _lpips_tensor(ref, device)
+        dist_t = _lpips_tensor(dist, device)
+        try:
+            model = _get_lpips_model(device, net)
+        except Exception:
+            return None
+        out = model(ref_t, dist_t)
+    return float(out.mean())
+
+
+def lpips_map(ref, dist, device=None, net='alex'):
+    """Return the spatial official-LPIPS map ``(1, 1, H, W)`` for [0, 1] images.
+
+    None when torch or lpips is unavailable. Callers derive full/ROI/BG/edge
+    scalars from this single map.
+    """
+    if torch is None:
+        return None
+    device = _resolve_device(device)
+    with torch.no_grad():
+        ref_t = _lpips_tensor(ref, device)
+        dist_t = _lpips_tensor(dist, device)
+        try:
+            model = _get_lpips_model(device, net)
+        except Exception:
+            return None
+        return model(ref_t, dist_t)
+
+
+def lpips_roi(ref, dist, mask, device=None, net='alex'):
+    """Mask-weighted official LPIPS. None if torch or lpips is unavailable.
+
+    ``ref`` and ``dist`` are RGB images in [0, 1]. ``mask`` is a ``(H, W)``
+    binary map. Returns the mean of the spatial LPIPS map weighted by ``mask``.
+    """
+    if torch is None:
+        return None
+    device = _resolve_device(device)
+    with torch.no_grad():
+        ref_t = _lpips_tensor(ref, device)
+        dist_t = _lpips_tensor(dist, device)
+        mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
+        if mask_t.ndim == 2:
+            mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+        try:
+            model = _get_lpips_model(device, net)
+        except Exception:
+            return None
+        d = model(ref_t, dist_t)  # (1, 1, H, W)
+        w_sum = mask_t.sum() + 1e-8
+        value = (d * mask_t).sum() / w_sum
+    return float(value)
+
+
+# Optional VGG-L2 diagnostic (kept behind --use-vgg-l2; distinct cache name to
+# avoid the historical _vgg name collision with the training loss module).
+_VGG_L2_LAYERS = ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3', 'relu5_3']
+_VGG_L2_RELU_INDICES = {
+    'relu1_2': 3,
+    'relu2_2': 8,
+    'relu3_3': 15,
+    'relu4_3': 22,
+    'relu5_3': 29,
+}
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+_vgg_l2_cache = {}
+
+
+def _get_vgg_l2_features(device):
+    key = str(device)
+    feats = _vgg_l2_cache.get(key)
+    if feats is not None:
+        return feats
+    import torchvision
+    try:
+        weights = torchvision.models.VGG16_Weights.DEFAULT
+    except AttributeError:
+        weights = None
+    try:
+        model = torchvision.models.vgg16(weights=weights)
+    except Exception:
+        model = torchvision.models.vgg16(weights=None)
+    feats = model.features.eval().to(device)
+    for p in feats.parameters():
+        p.requires_grad_(False)
+    _vgg_l2_cache[key] = feats
+    return feats
+
+
+def _vgg_l2_activations(feats, x):
+    out = {}
+    for idx, module in enumerate(feats):
+        x = module(x)
+        if isinstance(module, torch.nn.ReLU):
+            for name, relu_idx in _VGG_L2_RELU_INDICES.items():
+                if idx == relu_idx:
+                    out[name] = x
+    return out
+
+
+def vgg_l2(ref, dist, device=None):
+    """VGG16 feature-space L2 distance (diagnostic only). None if no torch."""
+    if torch is None:
+        return None
+    device = _resolve_device(device)
+    with torch.no_grad():
+        ref_t = torch.as_tensor(ref, dtype=torch.float32, device=device)
+        dist_t = torch.as_tensor(dist, dtype=torch.float32, device=device)
+        if ref_t.ndim == 3:
+            ref_t = ref_t.unsqueeze(0)
+            dist_t = dist_t.unsqueeze(0)
+        if ref_t.shape[1] == 1:
+            ref_t = ref_t.repeat(1, 3, 1, 1)
+            dist_t = dist_t.repeat(1, 3, 1, 1)
         mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
         std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
-        ref = (ref - mean) / std
-        dist = (dist - mean) / std
-
-        def acts(x):
-            out = {}
-            for idx, module in enumerate(feats):
-                x = module(x)
-                if isinstance(module, torch.nn.ReLU):
-                    for name, relu_idx in _VGG_RELU_INDICES.items():
-                        if idx == relu_idx:
-                            out[name] = x
-            return out
-
-        a_ref = acts(ref)
-        a_dist = acts(dist)
+        feats = _get_vgg_l2_features(device)
+        a_ref = _vgg_l2_activations(feats, (ref_t - mean) / std)
+        a_dist = _vgg_l2_activations(feats, (dist_t - mean) / std)
         total = 0.0
-        for layer in _VGG_LAYERS:
+        for layer in _VGG_L2_LAYERS:
             d = (a_ref[layer] - a_dist[layer]).norm(2, dim=1).mean()
             total = total + float(d)
-    return total / len(_VGG_LAYERS)
+    return total / len(_VGG_L2_LAYERS)
 
 
 def psnr_masked(ref, dist, mask):
@@ -281,76 +372,3 @@ def msssim_bbox(ref, dist, mask):
     if crop_ref.shape[0] < 32 or crop_ref.shape[1] < 32:
         return float(msssim(ref, dist))
     return float(msssim(crop_ref, crop_dist))
-
-
-def _vgg_activations(x, device):
-    """Return the ``VGG_LAYERS`` activations of an already-normalized batch."""
-    feats = _get_vgg_features(device)
-    out = {}
-    for idx, module in enumerate(feats):
-        x = module(x)
-        if isinstance(module, torch.nn.ReLU):
-            for name, relu_idx in _VGG_RELU_INDICES.items():
-                if idx == relu_idx:
-                    out[name] = x
-    return out
-
-
-def _normalize_imagenet(x, device):
-    mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-    std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
-    return (x - mean) / std
-
-
-def vgg_reference_acts(ref, device=None):
-    """Precompute reference VGG activations once for reuse across steps.
-
-    Returns the ``VGG_LAYERS`` activation dict, or None when torch is absent.
-    """
-    if torch is None:
-        return None
-    device = _resolve_device(device)
-    with torch.no_grad():
-        ref = torch.as_tensor(ref, dtype=torch.float32, device=device)
-        if ref.ndim == 3:
-            ref = ref.unsqueeze(0)
-        if ref.shape[1] == 1:
-            ref = ref.repeat(1, 3, 1, 1)
-        ref = _normalize_imagenet(ref, device)
-        return _vgg_activations(ref, device)
-
-
-def lpips_roi(ref, dist, mask, device=None, ref_acts=None):
-    """ROI-weighted perceptual distance in VGG feature space. None if no torch.
-
-    ``ref`` and ``dist`` are RGB images in [0, 1] of shape ``(C, H, W)`` (or
-    ``(1, C, H, W)``). ``mask`` is a ``(H, W)`` binary map weighted over each
-    feature scale. Mirrors the training-time weighted LPIPS.
-
-    Pass ``ref_acts`` from :func:`vgg_reference_acts` to avoid recomputing the
-    reference VGG forward pass for every progressive step.
-    """
-    if torch is None:
-        return None
-    device = _resolve_device(device)
-    with torch.no_grad():
-        dist = torch.as_tensor(dist, dtype=torch.float32, device=device)
-        mask = torch.as_tensor(mask, dtype=torch.float32, device=device)
-        if dist.ndim == 3:
-            dist = dist.unsqueeze(0)
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        if dist.shape[1] == 1:
-            dist = dist.repeat(1, 3, 1, 1)
-        dist = _normalize_imagenet(dist, device)
-
-        if ref_acts is None:
-            ref_acts = vgg_reference_acts(ref, device=device)
-        a_dist = _vgg_activations(dist, device)
-
-        total = 0.0
-        for layer in _VGG_LAYERS:
-            d = (ref_acts[layer] - a_dist[layer]).norm(2, dim=1, keepdim=True)
-            w = F.adaptive_avg_pool2d(mask, (d.size(2), d.size(3)))
-            total = total + float((d * w).mean())
-    return total / len(_VGG_LAYERS)

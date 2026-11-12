@@ -223,53 +223,132 @@ The visual loss has two modes selected by `--loss-mode`:
   normalized to mean 1 per sample. `--alpha-sem` defaults to 1.0 and
   `--alpha-edge` to 0.5. With no mask or edge input, `W` is all ones, so the
   loss matches the baseline.
-- `region` replaces `W` with an explicit ROI/background/edge loss per
-  progressive step:
+- `region` uses a mean-1 weighted L1 term over the feathered masks. The default
+  (overlap) weight map is
 
   ```text
-  L = roi_weight  * masked_l1(recon, target, roi_map)
-    + bg_weight   * masked_l1(recon, target, 1 - S)
-    + edge_weight * masked_l1(recon, target, E)
-    + lpips_weight * lpips(...)
+  w = w_roi * S_f + w_edge * E_f + w_bg * (1 - S_f)
   ```
 
-  where `masked_l1` uses masked means (`sum(|x-y| * m) / (sum(m) * C + eps)`).
-  `--roi-weight` (2.0), `--bg-weight` (0.5), and `--edge-weight` (0.5) set the
-  term weights. `--boundary-band` (>0) boosts a max-pool dilated boundary ring
-  around the ROI by `--boundary-weight`. `--roi-ramp linear` ramps the ROI
-  weight from `--roi-ramp-start` at step 1 to `1.0` at step N. Empty masks
-  fall back to the legacy term for that sample and the count is logged.
-  `--lpips-scope` (`full`/`roi`) and `--lpips-steps` (`final`/`last3`/`all`)
-  control the LPIPS term; `last3` avoids the final-only objective that caused
-  the step-10 PSNR collapse.
+  `--region-partition disjoint` switches to a mutually exclusive split, so
+  "background" strictly means pixels that are neither object nor edge:
+
+  ```text
+  w = w_roi * S_f + w_edge * E_f * (1 - S_f) + w_bg * (1 - S_f) * (1 - E_f)
+  ```
+
+  The term is `sum(|x - y| * w) / (sum(w) * C + eps)`. `S_f` and `E_f` come
+  from `feathered_mask(S, E, --gate-feather)`. The weights are per phase.
+  `--phase-schedule` sets the phase of each progressive step. `--w-roi`,
+  `--w-edge`, and `--w-bg` are per-phase weight lists. `--region-norm mean1`
+  selects this normalization. `--region-norm sum` keeps the older
+  sum-of-masked-means form, and its ROI/background/edge terms stay connected to
+  the graph. A crop uses the region loss when it has an object mask *or* an edge
+  map. A missing `S_f` with a present `E_f` becomes a zero tensor, so the edge
+  and background weights still apply. Plain L1 is used only when both maps are
+  empty for that sample. Phase 1 still gates on `S_f`, so an edge-only crop does
+  not update the object phase; phase 2 gates on `E_f` and applies the edge
+  weights.
+  `--region-partition` defaults to `overlap`. The fallback fix changes every
+  region ablation (B, C, D, D-soft, D-grouping, D-Strong). Existing B/C/D
+  checkpoints used the old fallback. Retrain D as the control for D-Strong and
+  treat B as an old-fallback checkpoint until it is retrained.
+
+The perceptual term uses the official `lpips` package (AlexNet, spatial map),
+not VGG-L2. `--lpips-scope` (`full`/`roi`) and `--lpips-steps`
+(`final`/`last3`/`all`) control the LPIPS term. `--lpips-net` selects `alex` or
+`vgg`. `--use-vgg-l2` adds the older VGG-L2 distance as a diagnostic metric.
 
 `--use-conditioning` adds conditioning that reads `(S, E)` and does not change
 the input channels of existing layers. `--conditioning-mode legacy` uses a
 pooled `FiLM` at the four pixel-shuffle scales of `DecoderCell`/`DecoderCell2`
 plus a `MaskAdd` branch in the encoder. `--conditioning-mode spatial` uses
-`SpatialFiLM`, which pools the semantic map to the feature resolution (not
-`(1,1)`) so the modulation varies across space. `--conditioning-init zero`
-zero-initializes the new heads so the module is the identity at start.
+`SpatialFiLM`. `SpatialFiLM` is spatially varying FiLM: it pools the semantic
+map to the feature resolution (not `(1,1)`) and applies a per-position scale and
+shift. It is not SPADE; there is no normalization layer.
+`--conditioning-init zero` zero-initializes the new heads so the module is the
+identity at start.
+
+`--spatial-bit-alloc` adds a hard code-domain mask (used by D-Strong+Bit-Alloc).
+After the binarizer, `code_block_mask()` in `semantic_loss.py` downsamples the
+raw `S` (phase 1) or `E` (phase 2) to code resolution and zeroes masked code
+positions, so those positions transmit no bits. Phases 0 and 3 return `None`
+(full code map). The mask is applied identically in `train.py` and
+`util.py:forward_model`, so training, in-training eval, standalone eval, and
+`semantic_inference.py` all agree. `evaluate.py` counts only non-masked positions
+for the per-prefix ramp and the total bytes (`code_bitrate_bytes` in
+`mask_codec.py`). The `.codes` files are still written full; the sparse layout is
+not materialized in a file because nothing in the repo decodes `.codes` files.
 
 The ablation ladder is:
 
-- **A**: baseline copy, no mask or edge arguments, legacy loss, no LPIPS.
-- **B**: region loss (`--loss-mode region`). The architecture is unchanged, so
-  B is checkpoint-compatible with A.
+- **A** (`A*`): baseline. No mask or edge arguments. Legacy loss. No LPIPS. Its
+  early-exit path matches `codec/src/` (see below).
+- **B**: region loss (`--loss-mode region`, `--region-norm mean1`) plus official
+  LPIPS. No conditioning. No gating. A flat phase schedule.
 - **C**: B plus spatial conditioning (`--use-conditioning`,
   `--conditioning-mode spatial`, `--conditioning-init zero`).
+- **D**: C plus residual gating (`--gate-mode mask`) and the object-first phase
+  schedule (`--phase-schedule 0,1,1,1,2,2,3,3,3,3`).
+- **D-soft**: C plus the object-first phase schedule with `--gate-mode none`.
+- **D-grouping**: D with the ROI-late phase schedule (`0,3,3,3,2,2,1,1,1,1`).
+- **D-Strong**: a tuned object-first proposal. Disjoint three-way partition
+  (`--region-partition disjoint`), object weights `1,8,1,0.3`, background
+  `1,0.1,0.5,1`, `--gate-feather 1`, `--lpips-scope roi`, and the balanced phase
+  schedule `0,1,1,1,1,2,2,3,3,3`. Trained from scratch.
+- **D-Strong+Bit-Alloc**: D-Strong plus `--spatial-bit-alloc`, so object/edge
+  layers transmit fewer bits. Trained from scratch.
 
-A uses the baseline loss from `codec/src`. The notebook never adds
-`--use-wlpips` to A. For B and C, `USE_WLPIPS` controls the weighted LPIPS term.
-The notebook sets `LPIPS_SCOPE=roi` and `LPIPS_STEPS=last3` for B/C, and
-`BEST_METRIC=mean` so the best checkpoint is selected by mean PSNR over steps
-instead of the anomalous final step.
+The notebook never adds `--use-wlpips` to A. For B and later, `USE_WLPIPS`
+controls the weighted LPIPS term. The notebook sets `BEST_METRIC=psnr+msssim`
+for all runs.
 
-Warm start: C starts from B, not from scratch. Point `--load-model-dir` at B's
-`model/` directory and load with `--load-strict false`. Shared weights load and
-new conditioning keys keep their zero init, so C starts identical to B. A
-single-run resume (same `--model-dir`) still uses strict loading via
-`--load-model-name`/`--load-iter`.
+Warm start: B starts from A. C starts from B. D-soft and D-grouping start from
+C. D, D-Strong, and D-Strong+Bit-Alloc train from scratch (`LOAD_MODEL_DIR =
+None`). Point `--load-model-dir` at the source `model/` directory. Load B from A
+with `--load-strict false`; the refinement `extra_*` keys stay zero-init. Load C
+from B with `--load-strict false`; the zero-init conditioning heads keep C
+identical to B at step 0. Load D-soft and D-grouping from C with
+`--load-strict true`; gating and the phase schedule do not add parameters. A
+single-run resume (same `--model-dir`) uses `--load-model-name`/`--load-iter`.
+
+#### Early-exit path and LR schedule
+
+The early-exit path for A matches `codec/src/`:
+
+- `EarlyExit` is `PixelShuffle -> 1x1 conv` (no progressive head).
+- The final decoder conv is `1x1`.
+- The early-exit inputs are not detached.
+
+The default `--ee-loss-weight` is 0.25, matching `codec/src/`. The progressive
+early-exit head, detached inputs, and 3x3 output conv were a B/C-only artifact
+fix. They regressed A's early exits from about 30 dB to about 16 dB and slowed
+the base reconstruction, so they are reverted. Do not apply them to A.
+
+A uses `--ee-head src`. B and all later ablations use `--ee-head refined`: `src`
+plus a parallel zero-initialized refinement branch (`extra_reduce ->
+PixelShuffle -> 3x3 extra_conv`). The branch is exactly zero at init, so the head
+equals `src` until it learns. The existing `conv` keys and shapes are unchanged.
+This keeps the B-and-later early exits from collapsing to the
+checkerboard/grayscale artifact without changing A. Load B from A with
+`--load-strict false` (the extra keys stay at their zero init); load
+D-soft/D-grouping from C with `--load-strict true` (same refined keys). D,
+D-Strong, and D-Strong+Bit-Alloc train from scratch.
+
+The LR schedule is fraction-based. If `--schedule` is unset, `train.py` derives
+the milestones from `--schedule-frac` (default `0.5,0.6,0.7,0.8,0.9`) times
+`--max-train-iters`. The five milestones match the reference schedule
+(`10000,12000,14000,16000,18000` at 20k) and avoid the late-training noise of
+the three-milestone schedule. `--lr-schedule` selects `multistep` or `cosine`.
+`--lr-warmup-iters` adds a linear warmup. `--lr-eta-min` sets the cosine floor.
+`--warm-start-lr` overrides the base LR for `--load-model-dir` warm starts.
+
+`--seed` (default `0`) seeds Python, NumPy, PyTorch, and all CUDA devices before
+model and loader creation. DDP ranks use `seed + rank`. `dataset.py` passes a
+top-level `seed_worker` through `functools.partial` as `worker_init_fn`, so
+`spawn` workers seed from the run seed, rank, and worker id. `--deterministic`
+disables cuDNN autotuning and enables deterministic kernels; without it, exact
+GPU reproducibility is approximate. The notebook uses `SEED = 1234`.
 
 The semantic notebook reads these paths:
 
@@ -283,20 +362,36 @@ data/kinetics/train_edges|test_edges/<clip>/frame_%04d.png
 derf and UVG use `data/<dataset>/{frames,mv,masks,edges}/<seq>/`. Use `data/`,
 not `data_old/` or the original authors' paths.
 
-The new modules are `semantic_loss.py` (weighted L1/LPIPS and the region loss),
+The new modules are `semantic_loss.py` (weighted L1, the mean-1 region loss with
+the phase schedule and the disjoint/overlap partition, the gate helpers, the
+`code_block_mask` code-domain mask, and the official-LPIPS term),
 `conditioning.py` (`MaskAdd`, `FiLM`, and `SpatialFiLM`), `mask_codec.py`
-(lossless mask/edge bytes), and `semantic_metrics.py` (VMAF, LPIPS, and the ROI
-metrics `psnr_masked`, `bbox_from_mask`, `msssim_bbox`, `lpips_roi`; IoU/F1 are
-still placeholders). `--use-wlpips` adds a VGG16 feature-space LPIPS term to
-training. `--use-vmaf` and `--use-lpips` add eval-only metrics and are
-best-effort. They return `None` or print nothing when the optional backend is
-missing.
+(lossless mask/edge bytes via `bitrate_bytes`, and sparse code accounting via
+`code_bitrate_bytes`), and `semantic_metrics.py` (VMAF, official LPIPS scalars
+and the spatial LPIPS map, and the ROI metrics `psnr_masked`, `bbox_from_mask`,
+`msssim_bbox`, `lpips_roi`; IoU/F1 are still placeholders).
+`--use-vmaf` and `--use-lpips` add eval-only metrics and are best-effort. They
+return `None` or print nothing when the optional backend is missing.
 
-Evaluation reports ROI-masked PSNR, background PSNR, bbox MS-SSIM, ROI LPIPS,
-and `total_bytes_per_frame` (mask + edge + visual code bytes) in addition to
-the full-frame metrics. A run with all-zero masks (ablation A) skips the ROI
-metrics and reports them as `None`. `--best-metric` (`last`/`mean`/`max`) picks
-the checkpoint PSNR criterion; new B/C runs use `mean`.
+Evaluation reports, per progressive step and per region (full, ROI, background,
+edge): PSNR, MS-SSIM (full frame and bbox-ROI), and official LPIPS. It also
+reports per-early-exit PSNR and MS-SSIM, per-prefix byte counts, mask and edge
+bytes per frame, and `total_bytes_per_frame`. ROI and edge metrics use the raw
+`S`/`E` maps, not the feathered maps, so they are comparable across
+`--gate-feather` values. A sample is skipped only when both maps are empty. Edge
+PSNR and LPIPS-edge include edge-only samples; ROI, background, and bbox metrics
+need a nonempty object mask. A run with no mask and no edge (ablation A) reports
+those metrics as `None`. Prefix accounting has three fields:
+`prefix_visual_bytes_raw` (cumulative packed bits), `prefix_visual_bytes`
+(cumulative DEFLATE code bytes, matching `code_bitrate_bytes`), and
+`prefix_total_bytes` (compressed code bytes plus mask and edge bytes). The
+totals are per-sample means over all evaluated samples.
+`--best-metric` (`last`/`mean`/`max`/`psnr+msssim`) picks the checkpoint
+criterion. New runs use `psnr+msssim`. Standalone evaluation accepts
+`"best"` as the iteration. Report the final 20,000 checkpoint as the headline
+number and the best checkpoint as a secondary result.
+`print_hierarchy_summary` prints the per-step delta table, the group-boundary
+gains, raw prefix bytes, and compressed prefix bytes.
 
 Do not modify or vendor `external/sam3`. Treat it as an external dependency.
 
@@ -334,8 +429,11 @@ notebook does these steps:
 1. Selects GPUs with `PREFERRED_GPU_IDS` and `AUTO_SELECT_GPUS`. It requires at
    least 12 GiB free on each selected GPU. It sets `CUDA_VISIBLE_DEVICES` before
    it imports PyTorch.
-2. Sets `HIERARCHIES`, `ABLATION` (`A`, `B`, or `C`), and the loss and metric
-   flags.
+2. Sets `HIERARCHIES`, `ABLATION` (`A`, `B`, `C`, `D`, `D-soft`,
+   `D-grouping`, `D-Strong`, or `D-Strong+Bit-Alloc`), `SEED`, `RUN_LEVELS`,
+   and the loss, metric, and LR flags. `set_quick_test()` keeps the derived
+   iteration counts and LR schedule consistent. `configure_ablation()` sets the
+   D-Strong globals so the two D-Strong cells cannot drift.
 3. Runs the mask/edge inspection cell. Run this cell before a long training.
 4. Builds and checks the train and eval datasets for each hierarchy level.
 5. Launches `codec/semantic/train.py` with `torchrun` and DDP, one cell per run.
@@ -345,14 +443,22 @@ notebook does these steps:
    Each `run_training` call gets its own timestamped folder, so re-runs do not
    overwrite earlier results. Set `RUN_TAG` to pin a fixed folder, or pass
    `EVAL_RUN_TAG`/`SUMMARY_RUN_TAG` to evaluate an earlier run.
+   `run_config.json` records the args, seed, git SHA, hostname, and creation
+   time. A stale config with different args or metadata raises an error. A full
+   D-Strong run also asserts that `LOAD_MODEL_DIR`, `RESUME_FROM`, and `RUN_TAG`
+   are unset.
 7. Loads a saved checkpoint and runs standalone evaluation. The evaluation cell
-   uses `EVAL_ABLATION` to select the ablation.
+   uses `EVAL_ABLATION` to select the ablation and evaluates `None` (latest) and
+   `"best"`. The full-grid cell is disabled because it reused the previous
+   ablation's globals.
 
-Set `QUICK_TEST = True` for a short check. The notebook passes
-`--mp-context spawn` and `--eval-stride 8`, which evaluates every eighth test
-sample. Run the standalone evaluation cell only after the selected hierarchy
-trainings finish. An evaluation between trainings keeps a model and CUDA-cached
-memory alive during the next training.
+Set `QUICK_TEST = True` for a short check; the D-Strong cells then train only
+level 0. The notebook passes `--mp-context spawn`, `--eval-stride 8`, and the
+LR flags. In-training evaluation uses `--eval-ee-msssim final` and
+`--eval-bbox-msssim final` to bound evaluation time; standalone evaluation
+computes every step. Run the standalone evaluation cell only after the selected
+hierarchy trainings finish. An evaluation between trainings keeps a model and
+CUDA-cached memory alive during the next training.
 
 ### Distributed training
 
@@ -379,21 +485,27 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
   real-time view.
 - For the base codec, TensorBoard events accumulate in
   `experiments/hierarchy_<level>/tensorboard/`.
-- `save_best()` writes `*_best.pth` when evaluation PSNR improves.
+- `save_best()` writes `*_best.pth` when the `--best-metric` score improves.
 - `RESUME_FROM` continues a level from a saved checkpoint.
-- `latest_iteration()` ignores `*_best.pth` files.
+- `latest_iteration()` ignores `*_best.pth` files because `best` is not an
+  integer. Standalone evaluation still accepts `iteration="best"` and loads
+  `{prefix}_{net}_best.pth` directly.
 - The semantic notebook writes `train.log`, `hierarchy<level>_<net>_<iter>.pth`,
   TensorBoard events, packed codes, and probe images under a timestamped run
   directory `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/<run_tag>/`.
 - Each semantic ablation and each run has its own `model/`, `output/`,
-  `tensorboard/`, and `train.log` subtree. A/B/C runs and repeat runs do not
-  overwrite each other. The checkpoint prefix stays `hierarchy<level>`.
+  `tensorboard/`, and `train.log` subtree. Ablations and repeat runs do not
+  overwrite each other. The checkpoint prefix stays `hierarchy<level>`. The
+  pre-repair A/B/C runs moved to `codec/semantic/old_experiments/`.
 - In the semantic notebook, `--save-codes` writes packed code files under
   `output/<suffix>/codes/`. `--save-out-img` is accepted, but `evaluate.py` does
   not dump per-frame images. Evaluation always writes one probe frame per run
   under `output/probe/`.
-- Semantic evaluation reports loss, MS-SSIM, PSNR, the four early-exit PSNRs,
-  mask and edge bytes per frame, and optional VMAF and LPIPS.
+- Semantic evaluation reports, per step, plain and per-region (ROI, background,
+  edge) PSNR, full-frame and bbox-ROI MS-SSIM, official LPIPS, the four
+  early-exit PSNRs and MS-SSIMs, per-prefix raw and compressed byte counts,
+  mask and edge bytes per frame, and optional VMAF. ROI and edge metrics use
+  the raw maps; edge metrics include edge-only samples.
 
 ### Performance notes
 
@@ -406,10 +518,16 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 - Keep DataLoader `persistent_workers=True`. Worker churn caused a host OOM kill in an
   earlier run.
 - Monitor `system/host_mem_available_gb` and `train/batch_sec` in TensorBoard.
-- A 20k semantic run on two ~20 GiB GPUs takes about 3 hours at ~0.5 s/iteration.
-  Keep `--eval-stride` above 1 to bound evaluation time.
-- `--use-wlpips` adds a VGG16 forward pass and extra memory. Turn it off when
-  memory is tight.
+- A 20k semantic run on two ~20 GiB GPUs takes about 3 hours of training at
+  ~0.5 s/iteration.
+- Evaluation is CPU-bound on MS-SSIM. `--eval-workers` (0 = auto,
+  `min(cpu_count, 8)`) sets the thread count. In-training evaluation uses
+  `--eval-msssim final`, `--eval-ee-msssim final`, and `--eval-bbox-msssim
+  final`, and the notebook uses `EVAL_STRIDE_IN_TRAIN = 32`. Standalone
+  evaluation uses `--eval-msssim all` and `EVAL_STRIDE = 8` (set 1 for the
+  full set). Keep `--eval-stride` above 1 for training runs.
+- `--use-wlpips` adds an official-LPIPS forward pass and extra memory. Turn it
+  off when memory is tight.
 
 ## Streamer details (`streamer/`)
 
@@ -548,9 +666,11 @@ take the argmax. Therefore test results are stochastic.
 - The semantic notebook reads `data/kinetics/` directly. It does not use
   `data/prepared_352x288/` and does not resize the Kinetics frames, masks, or
   edges.
-- Both codec trees use OpenCV and PIL. Weighted LPIPS needs torchvision VGG16.
-  VMAF is optional and needs the ffmpeg `libvmaf` filter or the `vmaf`
-  command-line tool. All run in `semswift_env`.
+- Both codec trees use OpenCV and PIL. The semantic LPIPS term and the LPIPS
+  metric use the official `lpips` package (AlexNet, bundled weights). The
+  optional `--use-vgg-l2` diagnostic needs torchvision VGG16. VMAF is optional
+  and needs the ffmpeg `libvmaf` filter or the `vmaf` command-line tool. All run
+  in `semswift_env`.
 - The streamer sets `CUDA_VISIBLE_DEVICES=''`. It is CPU-only.
 - `baselines/svc` and `baselines/shvc` are separate MPEG reference codebases. They are
   not integrated with the Python pipeline.
@@ -580,13 +700,17 @@ take the argmax. Therefore test results are stochastic.
   `codec/semantic/` manually, and make semantic-only changes only in
   `codec/semantic/`.
 - Preserve semantic checkpoint compatibility when you change the architecture.
-  A and B share the same state-dict keys. C adds `mask_add` and `film*` keys, and
-  strict resume fails across the A/B-to-C boundary. Warm-start C from B with
-  `--load-model-dir` (B's `model/`) and `--load-strict false`; the new
-  conditioning keys are zero-initialized via `--conditioning-init zero`, so C
-  starts identical to B.
-- Do not commit `codec/semantic/experiments/`, checkpoints, logs, TensorBoard
-  events, packed `.codes` files, or probe images.
+  The early-exit path matches `codec/src/`, so the pre-repair A/B/C checkpoints
+  load again. A and B share keys. C adds the `mask_add` and `film*` keys, so
+  strict resume fails across the A/B-to-C boundary. Warm-start B from A with
+  `--load-model-dir` and `--load-strict false`; the refinement heads are
+  zero-initialized. Warm-start C from B with `--load-strict false`; the
+  conditioning heads are zero-initialized. Warm-start D-soft and D-grouping from
+  C with `--load-strict true`. D, D-Strong, and D-Strong+Bit-Alloc train from
+  scratch.
+- Do not commit `codec/semantic/experiments/`,
+  `codec/semantic/old_experiments/`, checkpoints, logs, TensorBoard events,
+  packed `.codes` files, or probe images.
 - `codec/semantic/train.sh` and `codec/semantic/train_kinetics.sh` are legacy
   recipes with demo data or old NFS paths. Use the notebook for new runs.
 - Use `torchrun` or `python -m torch.distributed.run` with

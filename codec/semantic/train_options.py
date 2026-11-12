@@ -2,6 +2,40 @@
 
 import argparse
 
+
+def _int_list(value):
+    return [int(x) for x in value.split(',') if x.strip() != '']
+
+
+def _float_list(value):
+    return [float(x) for x in value.split(',') if x.strip() != '']
+
+
+def validate_semantic_args(args):
+    """Validate cross-flag constraints.
+
+    The phase schedule must have exactly ``--iterations`` entries so a changed
+    ``--iterations`` cannot silently misalign the phases and gates. The per-phase
+    weight lists must cover every phase.
+    """
+    schedule = args.phase_schedule
+    if isinstance(schedule, str):
+        schedule = _int_list(schedule)
+        args.phase_schedule = schedule
+    assert len(schedule) == args.iterations, (
+        'len(--phase-schedule) = %d != --iterations = %d'
+        % (len(schedule), args.iterations))
+    num_phases = max(schedule) + 1
+    for name in ('w_roi', 'w_edge', 'w_bg'):
+        values = getattr(args, name)
+        if isinstance(values, str):
+            values = _float_list(values)
+            setattr(args, name, values)
+        assert len(values) >= num_phases, (
+            'len(--%s) = %d < num_phases = %d' % (name, len(values), num_phases))
+    return args
+
+
 parser = argparse.ArgumentParser()
 
 ######## Data ########
@@ -57,12 +91,54 @@ parser.add_argument('--roi-ramp', type=str, default='none',
                     help='none or linear; ramp ROI emphasis across progressive steps.')
 parser.add_argument('--roi-ramp-start', type=float, default=0.5,
                     help='ROI weight multiplier at step 1 when roi-ramp=linear.')
+
+######## Semantic hierarchy / residual gating ########
+parser.add_argument('--phase-schedule', type=_int_list,
+                    default=[0, 1, 1, 1, 2, 2, 3, 3, 3, 3],
+                    help='Comma-separated phase per progressive step '
+                         '(0=coarse, 1=ROI, 2=edge, 3=background).')
+parser.add_argument('--gate-mode', type=str, default='mask',
+                    choices=['none', 'mask'],
+                    help='mask = gate the encoder residual by the phase mask; '
+                         'none = no gating.')
+parser.add_argument('--gate-feather', type=int, default=2,
+                    help='Dilate+blur pixels applied to S and E (0 = hard gate).')
+parser.add_argument('--w-roi', type=_float_list,
+                    default=[1.0, 4.0, 1.0, 0.5],
+                    help='Per-phase ROI weight list.')
+parser.add_argument('--w-edge', type=_float_list,
+                    default=[1.0, 0.25, 2.0, 0.5],
+                    help='Per-phase edge weight list.')
+parser.add_argument('--w-bg', type=_float_list,
+                    default=[1.0, 0.25, 0.5, 1.0],
+                    help='Per-phase background weight list.')
 parser.add_argument('--lpips-scope', type=str, default='full',
                     choices=['full', 'roi'],
                     help='full or roi; region LPIPS weighting scope.')
-parser.add_argument('--lpips-steps', type=str, default='final',
+parser.add_argument('--lpips-steps', type=str, default='all',
                     choices=['final', 'last3', 'all'],
                     help='final, last3, or all; progressive steps for LPIPS.')
+parser.add_argument('--lpips-net', type=str, default='alex',
+                    choices=['alex', 'vgg'],
+                    help='Official lpips backbone: alex or vgg.')
+parser.add_argument('--region-norm', type=str, default='mean1',
+                    choices=['sum', 'mean1'],
+                    help='mean1 = mean-1 weighted mean; sum = legacy region sum.')
+parser.add_argument('--region-partition', type=str, default='overlap',
+                    choices=['overlap', 'disjoint'],
+                    help='overlap = w_roi*S + w_edge*E + w_bg*(1-S); '
+                         'disjoint = object/edge/background-other split.')
+parser.add_argument('--spatial-bit-alloc', action='store_true',
+                    help='Mask the binarized code map by the phase ROI/edge '
+                         'block mask so masked positions transmit no bits.')
+parser.add_argument('--ee-loss-weight', type=float, default=0.25,
+                    help='Weight of the combined early-exit loss term '
+                         '(reference codec uses 0.25).')
+parser.add_argument('--ee-head', type=str, default='src',
+                    choices=['src', 'refined'],
+                    help='src = reference PixelShuffle+1x1 early-exit head; '
+                         'refined = src plus a zero-initialized residual '
+                         'refinement branch (B/C/D).')
 
 ######## Semantic conditioning ########
 parser.add_argument('--use-conditioning', action='store_true',
@@ -84,6 +160,8 @@ parser.add_argument('--use-vmaf', action='store_true',
                     help='Compute VMAF during evaluation when available.')
 parser.add_argument('--use-lpips', action='store_true',
                     help='Compute LPIPS during evaluation when available.')
+parser.add_argument('--use-vgg-l2', action='store_true',
+                    help='Compute the diagnostic VGG-L2 distance during eval.')
 
 ######## Model ########
 parser.add_argument('--v-compress', action='store_true',
@@ -118,10 +196,25 @@ parser.add_argument('--clip', type=float, default=0.5,
                     help='Gradient clipping.')
 # parser.add_argument('--schedule', default='15000,40000,100000,250000', type=str,
 #                     help='Schedule milestones.')
-parser.add_argument('--schedule', default='50000,60000,70000,80000,90000', type=str,
-                    help='Schedule milestones.')
+parser.add_argument('--schedule', default=None, type=str,
+                    help='Comma-separated LR milestone iterations. If unset, '
+                         'derived from --schedule-frac x --max-train-iters.')
+parser.add_argument('--schedule-frac', type=_float_list,
+                    default=[0.5, 0.6, 0.7, 0.8, 0.9],
+                    help='Fractions of --max-train-iters for the LR milestones '
+                         'when --schedule is unset (matches the reference '
+                         'codec 10000,12000,14000,16000,18000 at 20k).')
 parser.add_argument('--gamma', type=float, default=0.5,
                     help='LR decay factor.')
+parser.add_argument('--lr-schedule', type=str, default='multistep',
+                    choices=['multistep', 'cosine'],
+                    help='multistep = step decay; cosine = cosine annealing.')
+parser.add_argument('--lr-warmup-iters', type=int, default=0,
+                    help='Linear LR warmup steps at the start of training (0 = off).')
+parser.add_argument('--lr-eta-min', type=float, default=1e-6,
+                    help='Final LR for the cosine schedule.')
+parser.add_argument('--warm-start-lr', type=float, default=None,
+                    help='Base LR override for --load-model-dir warm starts.')
 parser.add_argument('--batch-size', type=int, default=16, 
                     help='Batch size.')
 parser.add_argument('--eval-batch-size', type=int, default=1,
@@ -130,6 +223,20 @@ parser.add_argument('--eval-stride', type=int, default=1,
                     help='Evaluate every Nth test sample (1 = full set).')
 parser.add_argument('--eval-fp16', action='store_true',
                     help='Use FP16 autocast during evaluation inference.')
+parser.add_argument('--eval-workers', type=int, default=0,
+                    help='Threads for the CPU MS-SSIM eval pass (0 = auto).')
+parser.add_argument('--eval-msssim', type=str, default='all',
+                    choices=['all', 'final', 'off'],
+                    help='Main-output MS-SSIM steps during eval '
+                         '(all = every step, final = last step, off = none).')
+parser.add_argument('--eval-ee-msssim', type=str, default='all',
+                    choices=['all', 'final', 'off'],
+                    help='Early-exit MS-SSIM steps during eval '
+                         '(all = every step, final = last step, off = none).')
+parser.add_argument('--eval-bbox-msssim', type=str, default='all',
+                    choices=['all', 'final', 'off'],
+                    help='Bbox MS-SSIM steps during eval '
+                         '(all = every step, final = last step, off = none).')
 
 # To save computation, we compute objective for multiple
 # crops for each forward pass.
@@ -142,10 +249,22 @@ parser.add_argument('--num-workers', type=int, default=2,
 parser.add_argument('--early-stop', type=int, default=0,
                     help='Stop after this many evaluations without PSNR improvement. 0 disables it.')
 parser.add_argument('--best-metric', type=str, default='last',
-                    choices=['last', 'mean', 'max'],
-                    help='PSNR criterion for best checkpoint: last, mean, or max over steps.')
+                    choices=['last', 'mean', 'max', 'psnr+msssim'],
+                    help='PSNR criterion for best checkpoint: last, mean, max '
+                         'over steps, or psnr+msssim combined score.')
+parser.add_argument('--best-metric-w', type=float, default=1.0,
+                    help='Relative weight of msssim in the psnr+msssim score '
+                         '(score = psnr_mean/50 + best-metric-w * msssim_mean).')
 parser.add_argument('--mp-context', type=str, default='fork',
                     help='DataLoader multiprocessing context: fork or spawn.')
+
+######## Reproducibility ########
+parser.add_argument('--seed', type=int, default=0,
+                    help='Base random seed. DDP ranks use seed + rank.')
+parser.add_argument('--deterministic', action='store_true',
+                    help='Disable cuDNN autotuning and enable deterministic '
+                         'kernels. Exact GPU reproducibility is approximate '
+                         'without this flag.')
 
 ######## Experiment ########
 parser.add_argument('--out-dir', type=str, default='output',

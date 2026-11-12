@@ -37,3 +37,21 @@ def decode(data, shape):
 def bitrate_bytes(binary_map):
     """Return the compressed size of one binary map in bytes."""
     return len(_to_bytes(binary_map))
+
+
+def code_bitrate_bytes(code_map):
+    """DEFLATE size of a progressive code map with masked positions omitted.
+
+    ``code_map`` is ``(iterations * bits, h, w)`` of values in ``{-1, 0, +1}``.
+    A zero entry is a masked (non-transmitted) position, so only non-zero
+    positions are packed, in raster order over non-masked positions. For an
+    unmasked map (all values ``{-1, +1}``) this matches ``bitrate_bytes``
+    byte-for-byte.
+    """
+    values = (code_map.astype(np.int8) + 1) // 2  # {-1, 0, +1} -> {0, 0, 1}
+    keep = (code_map != 0).reshape(-1)
+    packed = np.packbits(values.reshape(-1)[keep])
+    buf = io.BytesIO()
+    np.savez_compressed(buf, shape=np.array(code_map.shape, dtype=np.int64),
+                        codes=packed)
+    return len(buf.getvalue())

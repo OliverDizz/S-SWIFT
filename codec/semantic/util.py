@@ -21,7 +21,31 @@ import torch.nn as nn
 
 import network
 from metric import msssim, psnr
+from semantic_loss import phase_of_step, gate_for_phase, code_block_mask
 from unet import UNet
+
+
+def feathered_mask(S, E, feather):
+    """Dilate and blur the binary masks ``S`` and ``E`` into feathered masks.
+
+    ``S`` and ``E`` are ``(B, 1, H, W)`` tensors (either may be None). With
+    ``feather <= 0`` the masks are returned unchanged (hard gating). With
+    ``feather > 0`` each mask is max-pool dilated by ``feather`` pixels and then
+    average-pool blurred by the same kernel, producing soft edges in [0, 1].
+    """
+    if S is None and E is None:
+        return None, None
+    if feather <= 0:
+        return S, E
+    S_f = _feather_one(S, feather) if S is not None else None
+    E_f = _feather_one(E, feather) if E is not None else None
+    return S_f, E_f
+
+
+def _feather_one(m, feather):
+    k = 2 * feather + 1
+    dilated = F.max_pool2d(m, kernel_size=k, stride=1, padding=feather)
+    return F.avg_pool2d(dilated, kernel_size=k, stride=1, padding=feather)
 
 
 def get_models(args, v_compress, bits, encoder_fuse_level, decoder_fuse_level):
@@ -293,12 +317,21 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
     code_arr=[torch.zeros(b,d,h,w).cuda() for i in range(args.iterations)]
     #cum_output_dd = torch.zeros(1, 3, height, width)
 
+    phase_schedule = getattr(args, 'phase_schedule', '0,1,1,1,2,2,3,3,3,3')
+    gate_mode = getattr(args, 'gate_mode', 'mask')
+    gate_feather = getattr(args, 'gate_feather', 2)
+    S_f, E_f = feathered_mask(S, E, gate_feather)
+
     for i in range(iterations):
 
+        phase = phase_of_step(i, phase_schedule)
+        gate_i = gate_for_phase(phase, S_f, E_f, gate_mode)
+        gated_res = res if gate_i is None else res * gate_i
+
         if args.v_compress and args.stack:
-            encoder_input = torch.cat([frame1, res, frame2], dim=1)
+            encoder_input = torch.cat([frame1, gated_res, frame2], dim=1)
         else:
-            encoder_input = res
+            encoder_input = gated_res
 
         # Encode.
         encoded, encoder_h_1, encoder_h_2, encoder_h_3 = encoder(
@@ -307,6 +340,10 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
 
         # Binarize.
         code = binarizer(encoded)
+        if getattr(args, 'spatial_bit_alloc', False):
+            block_mask = code_block_mask(phase, S, E, h, w)
+            if block_mask is not None:
+                code = code * block_mask
         #code_arr=[torch.zeros(b,d,h,w).cuda() for j in range(args.iterations)]
         code_arr[i] =code
         #code_arr.append(code)
@@ -317,7 +354,10 @@ def forward_model(model, cooked_batch, ctx_frames, args, v_compress,
             code, decoder_h_1, decoder_h_2, decoder_h_3, decoder_h_4,
             dec_unet_output1, dec_unet_output2, sem)
 
-        res = res - output
+        if gate_i is None:
+            res = res - output
+        else:
+            res = res - output * gate_i
         #out_img = out_img + output.data.cpu()
         #out_img_np = out_img.numpy().clip(0, 1)
         #out_imgs.append(out_img_np)

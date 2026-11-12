@@ -1,12 +1,28 @@
 import os
 import os.path
 import glob
+import functools
 
 import torch
 import torch.utils.data as data
 import numpy as np
 import random
 import cv2
+
+
+def seed_worker(worker_id, seed=0, rank=0):
+    """Seed one DataLoader worker.
+
+    This is a picklable top-level function so ``spawn`` DDP workers can use it
+    through ``functools.partial``. The seed combines the run seed, the DDP rank,
+    the worker id, and the per-worker seed that PyTorch already assigned, so
+    workers on different ranks do not produce identical crops.
+    """
+    derived = (int(seed) + 100003 * int(rank) + 7919 * int(worker_id)
+               + int(torch.initial_seed())) % (2 ** 32)
+    random.seed(derived)
+    np.random.seed(derived)
+    torch.manual_seed(derived)
 
 
 def get_loader(is_train, root, mv_dir, args):
@@ -34,6 +50,10 @@ def get_loader(is_train, root, mv_dir, args):
         'batch_size': args.batch_size if is_train else args.eval_batch_size,
         'num_workers': num_workers,
         'pin_memory': torch.cuda.is_available(),
+        'worker_init_fn': functools.partial(
+            seed_worker,
+            seed=getattr(args, 'seed', 0),
+            rank=rank),
     }
 
     if world_size > 1:

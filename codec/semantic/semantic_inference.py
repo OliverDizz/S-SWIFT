@@ -9,8 +9,10 @@ videos cover the whole sequence once levels 0, 1, and 2 are trained.
 from the first four progressive codes, not layer 4 alone.
 """
 
+import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,10 +35,11 @@ from util import eval_forward, get_models, set_eval
 
 import network
 
-DATASET, SEQ = "derf", "silent"
-ABLATION = "C"
-LEVELS = [0]
-CHECKPOINT_ITER = None
+DATASET, SEQ = "uvg", "Jockey"
+ABLATION = "D-Strong"
+LEVELS = [0, 1, 2]
+CHECKPOINT_ITER = None   # int, or "best" for the *_best.pth checkpoints
+RUN_TAG = None           # None -> most recent run directory for (level, ablation)
 OUTPUT_FPS = 10
 WRITE_GRID = True
 SAVE_PNG = False
@@ -56,6 +59,58 @@ HIERARCHIES = {
 }
 
 CHECKPOINT_NAMES = ["encoder", "binarizer", "decoder", "d2", "unet"]
+
+LEGACY_RUN_TAG = "legacy"
+
+
+def _experiment_root():
+    return REPO / "codec/semantic/experiments"
+
+
+def _is_run_tag(name):
+    return bool(re.fullmatch(r"\d{8}_\d{6}(_\d+)?", name))
+
+
+def _existing_run_tags(level, ablation):
+    base = _experiment_root() / f"hierarchy_{level}" / ablation
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.iterdir()
+                  if p.is_dir() and _is_run_tag(p.name))
+
+
+def _has_legacy_run(level, ablation):
+    return (_experiment_root() / f"hierarchy_{level}" / ablation
+            / "model").is_dir()
+
+
+def resolve_run_tag(level, ablation):
+    if RUN_TAG is not None:
+        return RUN_TAG
+    existing = _existing_run_tags(level, ablation)
+    if existing:
+        return existing[-1]
+    if _has_legacy_run(level, ablation):
+        return LEGACY_RUN_TAG
+    raise FileNotFoundError(
+        f"no run directory for hierarchy {level} / ablation {ablation}")
+
+
+def experiment_dir(level, ablation=None):
+    ablation = ABLATION if ablation is None else ablation
+    tag = resolve_run_tag(level, ablation)
+    base = _experiment_root() / f"hierarchy_{level}" / ablation
+    if tag == LEGACY_RUN_TAG:
+        return base
+    return base / tag
+
+
+def model_dir(level, ablation=None):
+    return experiment_dir(level, ablation) / "model"
+
+
+def run_config_path(level, ablation=None):
+    return experiment_dir(level, ablation) / "run_config.json"
 
 
 def clip_paths():
@@ -80,33 +135,76 @@ def build_args(level, frames, mv, masks, edges):
         "--decoder-fuse-level", str(cfg["decoder_fuse_level"]),
         "--batch-size", "1",
     ]
-    if ABLATION in ("B", "C"):
+    if ABLATION in ("B", "C", "D", "D-Strong", "D-Strong+Bit-Alloc"):
         argv += [
             "--train-mask", str(masks), "--eval-mask", str(masks),
             "--train-edge", str(edges), "--eval-edge", str(edges),
             "--alpha-sem", "1.0", "--alpha-edge", "0.5",
+            "--gate-mode", "mask" if ABLATION in ("D", "D-Strong", "D-Strong+Bit-Alloc") else "none",
         ]
-    if ABLATION == "C":
-        argv += ["--use-conditioning"]
+    if ABLATION in ("C", "D", "D-Strong", "D-Strong+Bit-Alloc"):
+        argv += [
+            "--use-conditioning",
+            "--conditioning-mode", "spatial",
+            "--conditioning-init", "zero",
+        ]
+    if ABLATION == "D":
+        argv += ["--phase-schedule", "0,1,1,1,2,2,3,3,3,3"]
+    if ABLATION in ("D-Strong", "D-Strong+Bit-Alloc"):
+        argv += [
+            "--phase-schedule", "0,1,1,1,1,2,2,3,3,3",
+            "--gate-feather", "1",
+        ]
+    if ABLATION == "D-Strong+Bit-Alloc":
+        argv += ["--spatial-bit-alloc"]
+    argv += ["--ee-head", "src" if ABLATION == "A" else "refined"]
     return parser.parse_args(argv)
 
 
-def latest_iter(model_dir, level):
+def resolve_args(level, frames, mv, masks, edges):
+    config_path = run_config_path(level)
+    if not config_path.exists():
+        if (ABLATION in ("D-Strong", "D-Strong+Bit-Alloc")
+                and experiment_dir(level).is_dir()):
+            raise RuntimeError(
+                f"missing {config_path}; a {ABLATION} model directory must "
+                "contain run_config.json so inference uses the trained flags")
+        return build_args(level, frames, mv, masks, edges)
+    argv = json.loads(config_path.read_text())["args"]
+    argv = argv + [
+        "--train", str(frames), "--eval", str(frames),
+        "--train-mv", str(mv), "--eval-mv", str(mv),
+    ]
+    if ABLATION in ("B", "C", "D", "D-soft", "D-grouping", "D-Strong", "D-Strong+Bit-Alloc"):
+        argv += [
+            "--train-mask", str(masks), "--eval-mask", str(masks),
+            "--train-edge", str(edges), "--eval-edge", str(edges),
+        ]
+    argv += ["--batch-size", "1"]
+    return parser.parse_args(argv)
+
+
+def latest_iter(level):
     prefix = f"hierarchy{level}"
     paths = [
-        p for p in model_dir.glob(f"{prefix}_encoder_*.pth")
+        p for p in model_dir(level).glob(f"{prefix}_encoder_*.pth")
         if p.stem.rsplit("_", 1)[-1].isdigit()
     ]
     if not paths:
-        raise FileNotFoundError(f"no checkpoint in {model_dir}")
+        raise FileNotFoundError(f"no checkpoint in {model_dir(level)}")
     return max(int(p.stem.rsplit("_", 1)[-1]) for p in paths)
 
 
+def checkpoint_suffix(iteration):
+    if isinstance(iteration, str) and iteration == "best":
+        return "best"
+    return "%08d" % int(iteration)
+
+
 def load_models(level, args, iteration):
-    model_dir = (REPO / "codec/semantic/experiments"
-                 / f"hierarchy_{level}" / ABLATION / "model")
+    suffix = checkpoint_suffix(iteration)
     paths = {
-        name: model_dir / f"hierarchy{level}_{name}_{iteration:08d}.pth"
+        name: model_dir(level) / f"hierarchy{level}_{name}_{suffix}.pth"
         for name in CHECKPOINT_NAMES
     }
     missing = [str(p) for p in paths.values() if not p.exists()]
@@ -120,14 +218,23 @@ def load_models(level, args, iteration):
     d2 = network.DecoderCell2(
         v_compress=args.v_compress, shrink=args.shrink, bits=args.bits,
         fuse_level=args.decoder_fuse_level,
-        use_conditioning=args.use_conditioning).cuda()
+        use_conditioning=args.use_conditioning,
+        conditioning_mode=getattr(args, 'conditioning_mode', 'legacy'),
+        conditioning_init=getattr(args, 'conditioning_init', 'random'),
+        ee_head=getattr(args, 'ee_head', 'src')).cuda()
 
     nets = [encoder, binarizer, decoder, d2]
     if unet is not None:
         nets.append(unet)
 
     for name, net in zip(CHECKPOINT_NAMES, nets):
-        net.load_state_dict(torch.load(paths[name], map_location="cuda:0"))
+        state = torch.load(paths[name], map_location="cuda:0")
+        try:
+            net.load_state_dict(state)
+        except RuntimeError:
+            state = {key.replace("module.", ""): value
+                     for key, value in state.items()}
+            net.load_state_dict(state)
     set_eval(nets)
     return nets
 
@@ -245,9 +352,9 @@ def main():
         raise SystemExit(f"frames directory not found: {frames}")
     if not mv.is_dir():
         raise SystemExit(f"motion-vector directory not found: {mv}")
-    if ABLATION in ("B", "C") and not masks.is_dir():
+    if ABLATION != "A" and not masks.is_dir():
         print(f"Warning: mask directory not found (zero-fill): {masks}")
-    if ABLATION in ("B", "C") and not edges.is_dir():
+    if ABLATION != "A" and not edges.is_dir():
         print(f"Warning: edge directory not found (zero-fill): {edges}")
 
     models = {}
@@ -256,12 +363,10 @@ def main():
     items = []
 
     for level in LEVELS:
-        args = build_args(level, frames, mv, masks, edges)
-        model_dir = (REPO / "codec/semantic/experiments"
-                     / f"hierarchy_{level}" / ABLATION / "model")
         try:
+            args = resolve_args(level, frames, mv, masks, edges)
             iteration = (CHECKPOINT_ITER if CHECKPOINT_ITER is not None
-                         else latest_iter(model_dir, level))
+                         else latest_iter(level))
             nets = load_models(level, args, iteration)
         except FileNotFoundError as exc:
             print(f"Skipping hierarchy {level}: {exc}")

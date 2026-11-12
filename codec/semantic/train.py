@@ -1,4 +1,6 @@
+import math
 import os
+import random
 import time
 import copy
 from datetime import timedelta
@@ -13,12 +15,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.autograd import Variable
 
 from dataset import get_loader
-from evaluate import run_eval
-from train_options import parser
+from evaluate import run_eval, print_hierarchy_summary
+from train_options import parser, validate_semantic_args
 from util import get_models, init_lstm, set_train, set_eval, init_d2
-from util import prepare_inputs, forward_ctx
+from util import prepare_inputs, forward_ctx, feathered_mask
 from semantic_loss import build_weight_map, weighted_l1, weighted_lpips
-from semantic_loss import build_roi_map, region_l1, ramp_multipliers
+from semantic_loss import region_l1, phase_of_step, phase_multipliers, gate_for_phase
+from semantic_loss import code_block_mask
 
 import network
 
@@ -58,10 +61,74 @@ def _all_reduce_mean(value):
     return out
 
 
-def main():
-    torch.backends.cudnn.benchmark = True
+def seed_everything(seed):
+    """Seed Python, NumPy, PyTorch, and all CUDA devices.
 
+    DDP ranks must pass ``seed + rank`` so ranks do not share the same random
+    stream (identical crops across GPUs would otherwise be possible).
+    """
+    seed = int(seed) % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+def _build_lr_scheduler(solver, args, base_lr):
+    """Return an LR scheduler with optional linear warmup.
+
+    Supports a step-decay schedule (``--lr-schedule multistep``, the default)
+    and a cosine schedule (``--lr-schedule cosine``). ``--lr-warmup-iters`` adds
+    a linear ramp from ~0 to ``base_lr`` at the start of either schedule. The
+    scheduler is a single ``LambdaLR`` so ``scheduler.last_epoch`` resume and
+    ``get_last_lr`` keep working unchanged.
+    """
+    warmup = max(0, int(getattr(args, 'lr_warmup_iters', 0)))
+
+    if getattr(args, 'lr_schedule', 'multistep') == 'cosine':
+        t_max = max(1, int(args.max_train_iters) - warmup)
+        eta_min = float(getattr(args, 'lr_eta_min', 1e-6))
+
+        def cosine_mult(step):
+            if warmup > 0 and step < warmup:
+                return (step + 1) / max(1, warmup)
+            t = min(float(step - warmup), float(t_max))
+            ratio = 0.5 * (1.0 + math.cos(math.pi * t / t_max))
+            lr = eta_min + (base_lr - eta_min) * ratio
+            return lr / base_lr
+
+        return LS.LambdaLR(solver, lr_lambda=cosine_mult)
+
+    milestones = sorted(int(s) for s in args.schedule.split(','))
+
+    def step_mult(step):
+        if warmup > 0 and step < warmup:
+            return (step + 1) / max(1, warmup)
+        mult = 1.0
+        for m in milestones:
+            if step >= m:
+                mult *= args.gamma
+        return mult
+
+    return LS.LambdaLR(solver, lr_lambda=step_mult)
+
+
+def main():
     args = parser.parse_args()
+    args = validate_semantic_args(args)
+
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.backends.cudnn.benchmark = True
+
+    if args.schedule is None:
+        args.schedule = ','.join(
+            str(int(args.max_train_iters * f)) for f in args.schedule_frac)
 
     if 'LOCAL_RANK' in os.environ:
         local_rank = int(os.environ['LOCAL_RANK'])
@@ -82,8 +149,12 @@ def main():
     args.world_size = world_size
     args.local_rank = local_rank
 
+    seed_everything(args.seed + rank)
+
     if rank == 0:
         print(args)
+        print('Seed: %d (+ rank offset); deterministic: %s'
+              % (args.seed, args.deterministic))
 
     writer = None
     if rank == 0 and args.tensorboard_dir:
@@ -117,7 +188,8 @@ def main():
         bits=args.bits, fuse_level=args.decoder_fuse_level,
         use_conditioning=args.use_conditioning,
         conditioning_mode=getattr(args, 'conditioning_mode', 'legacy'),
-        conditioning_init=getattr(args, 'conditioning_init', 'random')).cuda()
+        conditioning_init=getattr(args, 'conditioning_init', 'random'),
+        ee_head=getattr(args, 'ee_head', 'src')).cuda()
 
     nets = [encoder, binarizer, decoder, d2]
     if unet is not None:
@@ -140,10 +212,12 @@ def main():
 
     params = [{'params': net.parameters()} for net in nets]
 
-    solver = optim.Adam(params, lr=args.lr)
+    base_lr = args.lr
+    if args.warm_start_lr is not None and args.load_model_dir:
+        base_lr = args.warm_start_lr
 
-    milestones = [int(s) for s in args.schedule.split(',')]
-    scheduler = LS.MultiStepLR(solver, milestones=milestones, gamma=args.gamma)
+    solver = optim.Adam(params, lr=base_lr)
+    scheduler = _build_lr_scheduler(solver, args, base_lr)
 
     if rank == 0 and not os.path.exists(args.model_dir):
         print("Creating directory %s." % args.model_dir)
@@ -250,14 +324,11 @@ def main():
                 sem = torch.cat([S, E], dim=1)
 
             is_region = args.loss_mode == 'region'
+            S_f, E_f = feathered_mask(S, E, args.gate_feather)
 
             W = None
-            roi_map = None
             if S is not None or E is not None:
-                if is_region:
-                    roi_map = build_roi_map(
-                        S, args.boundary_band, args.boundary_weight)
-                else:
+                if not is_region:
                     W = build_weight_map(
                         S, E, args.alpha_sem, args.alpha_edge)
 
@@ -265,7 +336,7 @@ def main():
             lpips_steps = 'final'
             if args.use_wlpips:
                 if is_region:
-                    lpips_W = roi_map if args.lpips_scope == 'roi' else None
+                    lpips_W = S_f if args.lpips_scope == 'roi' else None
                     lpips_steps = args.lpips_steps
                 else:
                     lpips_W = W
@@ -278,12 +349,13 @@ def main():
             d2_outputs = []
 
             def region_term(recon, target, step_idx):
-                roi_mult, bg_mult = ramp_multipliers(
-                    step_idx, args.iterations, args.roi_ramp, args.roi_ramp_start)
+                phase = phase_of_step(step_idx, args.phase_schedule)
+                w_roi, w_edge, w_bg = phase_multipliers(
+                    phase, args.w_roi, args.w_edge, args.w_bg)
                 return region_l1(
-                    recon, target, S, E, roi_map,
-                    args.roi_weight, args.bg_weight, args.edge_weight,
-                    roi_mult, bg_mult)
+                    recon, target, S_f, E_f, w_roi, w_edge, w_bg,
+                    args.region_norm,
+                    partition=getattr(args, 'region_partition', 'overlap'))
 
             losses = []
             rec2_losses = []
@@ -298,23 +370,34 @@ def main():
             code_arr = [torch.zeros(b, d, h, w).cuda() for i in range(args.iterations)]
 
             for i in range(args.iterations):
+                phase = phase_of_step(i, args.phase_schedule)
+                gate_i = gate_for_phase(phase, S_f, E_f, args.gate_mode)
+                gated_res = res if gate_i is None else res * gate_i
+
                 if args.v_compress and args.stack:
-                    encoder_input = torch.cat([frame1, res, frame2], dim=1)
+                    encoder_input = torch.cat([frame1, gated_res, frame2], dim=1)
                 else:
-                    encoder_input = res
+                    encoder_input = gated_res
 
                 encoded, encoder_h_1, encoder_h_2, encoder_h_3 = encoder(
                     encoder_input, encoder_h_1, encoder_h_2, encoder_h_3,
                     warped_unet_output1, warped_unet_output2, sem)
 
                 codes = binarizer(encoded)
+                if args.spatial_bit_alloc:
+                    block_mask = code_block_mask(phase, S, E, h, w)
+                    if block_mask is not None:
+                        codes = codes * block_mask
                 code_arr[i] = codes
 
                 (output, decoder_h_1, decoder_h_2, decoder_h_3, decoder_h_4) = decoder(
                     codes, decoder_h_1, decoder_h_2, decoder_h_3, decoder_h_4,
                     warped_unet_output1, warped_unet_output2, sem)
 
-                res = res - output
+                if gate_i is None:
+                    res = res - output
+                else:
+                    res = res - output * gate_i
                 out_img = out_img + output.data
 
                 if is_region:
@@ -386,7 +469,7 @@ def main():
                     ee4_losses.append(weighted_l1(in_img, out_ee4, W))
 
                 if args.use_wlpips and lpips_steps != 'final':
-                    d2_outputs.append(output_d2 + 0.5)
+                    d2_outputs.append(output_d2)
 
             bp_t1 = time.time()
 
@@ -396,19 +479,19 @@ def main():
             ee2_loss = sum(ee2_losses) / args.iterations
             ee3_loss = sum(ee3_losses) / args.iterations
             ee4_loss = sum(ee4_losses) / args.iterations
-            loss = (rec1_loss + rec2_loss) * 0.5 + (ee1_loss + ee2_loss + ee3_loss + ee4_loss) * 0.25
+            loss = (rec1_loss + rec2_loss) * 0.5 + (ee1_loss + ee2_loss + ee3_loss + ee4_loss) * args.ee_loss_weight
             lpips_value = 0.0
             if args.use_wlpips:
                 if lpips_steps == 'final':
                     lpips_value = weighted_lpips(
-                        in_img + 0.5, output_d2 + 0.5, lpips_W, args.lpips_weight)
+                        in_img, output_d2, lpips_W, args.lpips_weight, args.lpips_net)
                 else:
                     if lpips_steps == 'last3':
                         selected = d2_outputs[-3:]
                     else:
                         selected = d2_outputs
                     lpips_value = sum(
-                        weighted_lpips(in_img + 0.5, o, lpips_W, args.lpips_weight)
+                        weighted_lpips(in_img, o, lpips_W, args.lpips_weight, args.lpips_net)
                         for o in selected) / len(selected)
                 loss = loss + lpips_value
             loss.backward()
@@ -455,10 +538,12 @@ def main():
                         log_scalar('train/roi_density', float(S.mean()), train_iter)
                     if E is not None:
                         log_scalar('train/edge_density', float(E.mean()), train_iter)
-                    if S is not None:
-                        effective = args.roi_weight * roi_map + args.bg_weight * (1.0 - S)
-                        if E is not None:
-                            effective = effective + args.edge_weight * E
+                    if S_f is not None:
+                        w_roi, w_edge, w_bg = phase_multipliers(
+                            1, args.w_roi, args.w_edge, args.w_bg)
+                        effective = w_roi * S_f + w_bg * (1.0 - S_f)
+                        if E_f is not None:
+                            effective = effective + w_edge * E_f
                         log_scalar('train/effective_weight_mean', float(effective.mean()), train_iter)
                         log_scalar('train/effective_weight_max', float(effective.max()), train_iter)
                     fallback_count = int(region_fallback)
@@ -497,9 +582,12 @@ def main():
             if is_eval_iter:
                 set_eval(nets)
 
-                eval_args = args if rank == 0 else copy.copy(args)
+                eval_args = copy.copy(args)
                 eval_args.save_codes = False
                 eval_args.save_out_img = False
+                eval_args.eval_msssim = 'final'
+                eval_args.eval_ee_msssim = 'final'
+                eval_args.eval_bbox_msssim = 'final'
 
                 for eval_name, eval_loader in eval_loaders.items():
                     eval_begin = time.time()
@@ -522,10 +610,18 @@ def main():
                     psnr_ee2 = result.psnr_ee2
                     psnr_ee3 = result.psnr_ee3
                     psnr_ee4 = result.psnr_ee4
+                    msssim_ee1 = result.msssim_ee1
+                    msssim_ee2 = result.msssim_ee2
+                    msssim_ee3 = result.msssim_ee3
+                    msssim_ee4 = result.msssim_ee4
                     psnr_roi = result.psnr_roi
                     psnr_bg = result.psnr_bg
+                    psnr_edge = result.psnr_edge
                     msssim_bbox = result.msssim_bbox
                     lpips_roi = result.lpips_roi
+                    lpips_bg = result.lpips_bg
+                    lpips_edge = result.lpips_edge
+                    lpips_full = result.lpips_full
                     mask_bitrate = result.mask_bytes
                     edge_bitrate = result.edge_bytes
                     mask_iou = result.mask_iou
@@ -533,6 +629,9 @@ def main():
                     total_bytes = result.total_bytes_per_frame
                     vmaf_mean = result.vmaf
                     lpips_mean = result.lpips
+                    prefix_raw = result.prefix_visual_bytes_raw
+                    prefix_visual = result.prefix_visual_bytes
+                    prefix_total = result.prefix_total_bytes
 
                     if rank == 0:
                         print('Evaluation @iter %d done in %d secs' % (
@@ -557,6 +656,17 @@ def main():
                         if psnr_bg is not None:
                             print('%s BG PSNR : ' % eval_name
                                   + '\t'.join(['%.5f' % el for el in psnr_bg.tolist()]))
+                        if psnr_edge is not None:
+                            print('%s Edge PSNR: ' % eval_name
+                                  + '\t'.join(['%.5f' % el for el in psnr_edge.tolist()]))
+                        if lpips_full is not None:
+                            print('%s LPIPS full: ' % eval_name
+                                  + '\t'.join(['%.5f' % el
+                                               for el in np.asarray(lpips_full).tolist()]))
+                        if lpips_roi is not None:
+                            print('%s LPIPS ROI : ' % eval_name
+                                  + '\t'.join(['%.5f' % el
+                                               for el in np.asarray(lpips_roi).tolist()]))
                         if mask_bitrate is not None:
                             print('%s Mask bytes/frame: %.2f' % (eval_name, mask_bitrate))
                         if edge_bitrate is not None:
@@ -572,8 +682,9 @@ def main():
                             step = step_idx + 1
                             log_scalar('eval/%s/loss_step_%02d' % (eval_name, step),
                                        float(eval_loss[step_idx]), train_iter)
-                            log_scalar('eval/%s/msssim_step_%02d' % (eval_name, step),
-                                       float(mssim[step_idx]), train_iter)
+                            if np.isfinite(mssim[step_idx]):
+                                log_scalar('eval/%s/msssim_step_%02d' % (eval_name, step),
+                                float(mssim[step_idx]), train_iter)
                             log_scalar('eval/%s/psnr_step_%02d' % (eval_name, step),
                                        float(psnr[step_idx]), train_iter)
                             log_scalar('eval/%s/psnr_ee1_step_%02d' % (eval_name, step),
@@ -590,17 +701,37 @@ def main():
                             if psnr_bg is not None:
                                 log_scalar('eval/%s/psnr_bg_step_%02d' % (eval_name, step),
                                            float(psnr_bg[step_idx]), train_iter)
-                            if msssim_bbox is not None:
+                            if msssim_bbox is not None and np.isfinite(msssim_bbox[step_idx]):
                                 log_scalar('eval/%s/msssim_bbox_step_%02d' % (eval_name, step),
                                            float(msssim_bbox[step_idx]), train_iter)
                             if lpips_roi is not None:
                                 log_scalar('eval/%s/lpips_roi_step_%02d' % (eval_name, step),
                                            float(lpips_roi[step_idx]), train_iter)
+                            if psnr_edge is not None:
+                                log_scalar('eval/%s/psnr_edge_step_%02d' % (eval_name, step),
+                                           float(psnr_edge[step_idx]), train_iter)
+                            for ee_idx, msssim_ee in enumerate(
+                                    (msssim_ee1, msssim_ee2, msssim_ee3, msssim_ee4), 1):
+                                if msssim_ee is not None and np.isfinite(msssim_ee[step_idx]):
+                                    log_scalar('eval/%s/msssim_ee%d_step_%02d'
+                                               % (eval_name, ee_idx, step),
+                                               float(msssim_ee[step_idx]), train_iter)
+                            if lpips_full is not None:
+                                log_scalar('eval/%s/lpips_full_step_%02d' % (eval_name, step),
+                                           float(lpips_full[step_idx]), train_iter)
+                            if lpips_bg is not None and np.isfinite(lpips_bg[step_idx]):
+                                log_scalar('eval/%s/lpips_bg_step_%02d' % (eval_name, step),
+                                           float(lpips_bg[step_idx]), train_iter)
+                            if lpips_edge is not None and np.isfinite(lpips_edge[step_idx]):
+                                log_scalar('eval/%s/lpips_edge_step_%02d' % (eval_name, step),
+                                           float(lpips_edge[step_idx]), train_iter)
 
                         log_scalar('eval/%s/loss_mean' % eval_name,
                                    float(eval_loss.mean()), train_iter)
+                        mssim_mean = (float(np.nanmean(mssim))
+                                     if np.isfinite(mssim).any() else float('nan'))
                         log_scalar('eval/%s/msssim_mean' % eval_name,
-                                   float(mssim.mean()), train_iter)
+                            mssim_mean, train_iter)
                         log_scalar('eval/%s/psnr_mean' % eval_name,
                                    float(psnr.mean()), train_iter)
                         if mask_bitrate is not None:
@@ -622,6 +753,22 @@ def main():
                         if lpips_mean is not None:
                             log_scalar('eval/%s/lpips' % eval_name,
                                        lpips_mean, train_iter)
+                        if prefix_raw is not None:
+                            for pidx in range(len(prefix_raw)):
+                                log_scalar('eval/%s/prefix_raw_bytes_l%02d'
+                                           % (eval_name, pidx + 1),
+                                           float(prefix_raw[pidx]), train_iter)
+                        if prefix_visual is not None:
+                            for pidx in range(len(prefix_visual)):
+                                log_scalar('eval/%s/prefix_visual_bytes_l%02d'
+                                           % (eval_name, pidx + 1),
+                                           float(prefix_visual[pidx]), train_iter)
+                        if prefix_total is not None:
+                            for pidx in range(len(prefix_total)):
+                                log_scalar('eval/%s/prefix_bytes_l%02d' % (eval_name, pidx + 1),
+                                           float(prefix_total[pidx]), train_iter)
+
+                        print_hierarchy_summary(result, args.phase_schedule, eval_name)
 
                     if args.best_metric == 'mean':
                         eval_psnr = float(psnr.mean())
@@ -629,6 +776,12 @@ def main():
                     elif args.best_metric == 'max':
                         best_step = int(np.argmax(psnr))
                         eval_psnr = float(psnr[best_step])
+                    elif args.best_metric == 'psnr+msssim':
+                        best_step = -1
+                        msssim_score = (float(np.nanmean(mssim))
+                                        if np.isfinite(mssim).any() else 0.0)
+                        eval_psnr = (float(psnr.mean()) / 50.0
+                                     + args.best_metric_w * msssim_score)
                     else:
                         best_step = len(psnr) - 1
                         eval_psnr = float(psnr[best_step])
@@ -639,7 +792,7 @@ def main():
                         patience = 0
                         if rank == 0:
                             save_best()
-                            print('New best PSNR %.5f at iter %d (step %s)' % (
+                            print('New best score %.5f at iter %d (step %s)' % (
                                 best_psnr, best_iter, best_step))
                     else:
                         patience += 1

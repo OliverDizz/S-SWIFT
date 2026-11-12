@@ -230,35 +230,45 @@ class DecoderCell(nn.Module):
 
 
 class EarlyExit(nn.Module):
-    def __init__(self, shuffle_up, conv_in):
+    def __init__(self, shuffle_up, conv_in, ee_head='src', extra_channels=8):
         super(EarlyExit, self).__init__()
+        if ee_head not in ('src', 'refined'):
+            raise ValueError('ee_head must be "src" or "refined"')
         self.shuffle_up = shuffle_up
         self.conv_in = conv_in
-        self.conv = nn.Conv2d(conv_in//(shuffle_up**2), 3, kernel_size=1, stride=1, padding=0, bias=False)
-        ''' # progressive
-        self.exit_head = []
-        while self.shuffle_up != 2:
-            self.shuffle_up = self.shuffle_up//2
-            self.conv_in = self.conv_in//4
-            self.exit_head.append(nn.PixelShuffle(2))
-            self.exit_head.append(nn.Conv2d(self.conv_in, self.conv_in, kernel_size=1, stride=1, padding=0, bias=False))
-            self.exit_head.append(nn.ReLU())
-        self.exit_head.append(nn.PixelShuffle(2))
-        self.exit_head.append(nn.Conv2d(self.conv_in//4, 3, kernel_size=1, stride=1, padding=0, bias=False))
-        self.exit_head = nn.Sequential(*self.exit_head)'''
+        self.ee_head = ee_head
+        self.conv = nn.Conv2d(
+            conv_in // (shuffle_up ** 2), 3,
+            kernel_size=1, stride=1, padding=0, bias=False)
+        if ee_head == 'refined':
+            # Parallel, zero-initialized residual refinement. It gives the
+            # low-resolution exits their own full-resolution channels and a
+            # 3x3 mixing conv so they can learn chroma and anti-aliasing under
+            # the semantic losses. The zero-init makes it exactly identity at
+            # step 0, so `src` checkpoints and the A->C warm start survive.
+            self.extra_reduce = nn.Conv2d(
+                conv_in, extra_channels * (shuffle_up ** 2),
+                kernel_size=1, stride=1, padding=0, bias=False)
+            self.extra_shuffle = nn.PixelShuffle(shuffle_up)
+            self.extra_conv = nn.Conv2d(
+                extra_channels, 3,
+                kernel_size=3, stride=1, padding=1, bias=False)
+            nn.init.zeros_(self.extra_conv.weight)
 
     def forward(self, input):
         x = F.pixel_shuffle(input, self.shuffle_up)
-        x = self.conv(x)
-        #x = self.exit_head(input)
-        return F.tanh(x) / 2
+        out = self.conv(x)
+        if self.ee_head == 'refined':
+            extra = self.extra_shuffle(self.extra_reduce(input))
+            out = out + self.extra_conv(extra)
+        return F.tanh(out) / 2
 
 
 
 class DecoderCell2(nn.Module):
     def __init__(self, v_compress, shrink, bits, fuse_level,
                  use_conditioning=False, conditioning_mode='legacy',
-                 conditioning_init='random'):
+                 conditioning_init='random', ee_head='src'):
 
         super(DecoderCell2, self).__init__()
 
@@ -268,6 +278,7 @@ class DecoderCell2(nn.Module):
         self.use_conditioning = use_conditioning
         self.conditioning_mode = conditioning_mode
         self.conditioning_init = conditioning_init
+        self.ee_head = ee_head
         print('\tDecoder fuse level: {}'.format(self.fuse_level))
 
         # Layers.
@@ -281,10 +292,10 @@ class DecoderCell2(nn.Module):
         #self.bn2 = nn.BatchNorm2d(128*10)
         #self.bn3 = nn.BatchNorm2d(512*10)
 
-        self.ee1 = EarlyExit(shuffle_up=16, conv_in=512)
-        self.ee2 = EarlyExit(shuffle_up=8, conv_in=512)
-        self.ee3 = EarlyExit(shuffle_up=4, conv_in=256)
-        self.ee4 = EarlyExit(shuffle_up=2, conv_in=128)
+        self.ee1 = EarlyExit(shuffle_up=16, conv_in=512, ee_head=ee_head)
+        self.ee2 = EarlyExit(shuffle_up=8, conv_in=512, ee_head=ee_head)
+        self.ee3 = EarlyExit(shuffle_up=4, conv_in=256, ee_head=ee_head)
+        self.ee4 = EarlyExit(shuffle_up=2, conv_in=128, ee_head=ee_head)
 
         self.rnn1 = ConvLSTMCell(
             512,
@@ -351,7 +362,7 @@ class DecoderCell2(nn.Module):
         x = hidden1[0]
         if self.use_conditioning and sem is not None:
             x = self.film1(x, sem)
-        out_ee1 = self.ee1(x) #.detach())
+        out_ee1 = self.ee1(x) #.detach()
         #print('4: {}'.format(x.shape))
         x = F.pixel_shuffle(x, 2) # 8x8, 128
         #print('5: {}'.format(x.shape))
@@ -365,7 +376,7 @@ class DecoderCell2(nn.Module):
         x = hidden2[0]
         if self.use_conditioning and sem is not None:
             x = self.film2(x, sem)
-        out_ee2 = self.ee2(x) #.detach())
+        out_ee2 = self.ee2(x) #.detach()
         x = F.pixel_shuffle(x, 2) # 16x16, 128
         #print('6: {}'.format(x.shape))
 
@@ -378,7 +389,7 @@ class DecoderCell2(nn.Module):
         x = hidden3[0]
         if self.use_conditioning and sem is not None:
             x = self.film3(x, sem)
-        out_ee3 = self.ee3(x) #.detach())
+        out_ee3 = self.ee3(x) #.detach()
         x = F.pixel_shuffle(x, 2) # 32x32, 64
         #print('7: {}'.format(x.shape))
 
@@ -391,7 +402,7 @@ class DecoderCell2(nn.Module):
         x = hidden4[0]
         if self.use_conditioning and sem is not None:
             x = self.film4(x, sem)
-        out_ee4 = self.ee4(x) #.detach())
+        out_ee4 = self.ee4(x) #.detach()
         x = F.pixel_shuffle(x, 2) # 64x64, 32
         #print('8: {}'.format(x.shape))
 

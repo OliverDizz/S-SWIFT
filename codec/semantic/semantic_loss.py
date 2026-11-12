@@ -1,24 +1,22 @@
 """Semantic weighting for the Swift visual loss.
 
 The mask ``S`` and edge ``E`` are binary side-information channels at full
-frame resolution (0/1). They are converted into a spatially-varying weight map
+frame resolution (0/1). Two loss paths exist:
 
-    W = 1 + alpha_sem * S + alpha_edge * E
+- ``legacy`` builds a spatially-varying weight map ``W = 1 + alpha_sem*S +
+  alpha_edge*E`` normalized to mean 1 per sample.
+- ``region`` builds a mean-1 weighted L1 term from per-phase ROI/edge/background
+  weights over the feathered masks ``S_f``/``E_f``.
 
-which is normalized to mean 1 per sample so that the loss magnitude matches the
-unweighted baseline and ``alpha_*`` controls only the ROI-vs-background
-emphasis. All-zero masks degrade gracefully to the baseline (W == 1).
+The perceptual term uses the official ``lpips`` package (AlexNet, spatial map)
+instead of the non-standard VGG-L2 distance.
 """
 
 import torch
 import torch.nn.functional as F
 
-VGG_LAYERS = ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3', 'relu5_3']
 
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
-
-_vgg_cache = {}
+CODE_BLOCK_MASK_THRESHOLD = 0.0
 
 
 def build_weight_map(S, E, alpha_sem=1.0, alpha_edge=0.5):
@@ -73,167 +71,221 @@ def masked_l1(x, y, mask, eps=1e-8):
     return num / den
 
 
-def build_roi_map(S, boundary_band=0, boundary_weight=0.5):
-    """Return a boundary-aware ROI map from the binary mask ``S``.
+def _as_int_list(values):
+    if isinstance(values, str):
+        return [int(x) for x in values.split(',') if x.strip() != '']
+    return [int(x) for x in values]
 
-    With ``boundary_band <= 0`` this is just ``S``. Otherwise the ROI interior
-    keeps weight 1 and a max-pool dilated ring around the ROI (the boundary
-    band) gets an extra ``boundary_weight``. The dilation is a max pool with
-    kernel ``2 * band + 1``, stride 1, and same padding, so no SciPy dependency
-    is needed.
+
+def _as_float_list(values):
+    if isinstance(values, str):
+        return [float(x) for x in values.split(',') if x.strip() != '']
+    return [float(x) for x in values]
+
+
+def phase_of_step(step_idx, phase_schedule):
+    """Return the 0-based phase index for a progressive step.
+
+    ``phase_schedule`` is a list (or comma-separated string) of length
+    ``num_steps`` mapping each step to its phase. Steps past the end reuse the
+    last phase.
     """
-    if S is None:
+    schedule = _as_int_list(phase_schedule)
+    if not schedule:
+        return 0
+    if step_idx < len(schedule):
+        return schedule[step_idx]
+    return schedule[-1]
+
+
+def phase_multipliers(phase, w_roi, w_edge, w_bg):
+    """Return ``(w_roi, w_edge, w_bg)`` for the given phase index.
+
+    ``w_roi``/``w_edge``/``w_bg`` are per-phase weight lists (or comma-separated
+    strings). A phase past the end reuses the last weight.
+    """
+    roi = _as_float_list(w_roi)
+    edge = _as_float_list(w_edge)
+    bg = _as_float_list(w_bg)
+
+    def pick(lst):
+        return lst[phase] if phase < len(lst) else lst[-1]
+
+    return pick(roi), pick(edge), pick(bg)
+
+
+def gate_for_phase(phase, S_f, E_f, gate_mode='mask'):
+    """Return the residual gate ``(B, 1, H, W)`` for a phase, or None.
+
+    - G0 (phase 0) and G3 (phase 3) gate on the full frame (gate = 1).
+    - G1 (phase 1) gates on the feathered ROI mask ``S_f``.
+    - G2 (phase 2) gates on the feathered edge map ``E_f``.
+
+    ``gate_mode == 'none'`` or missing masks degrade to ``None``, which callers
+    treat as gate = 1 (no gating).
+    """
+    if gate_mode == 'none' or (S_f is None and E_f is None):
         return None
-    if boundary_band <= 0:
-        return S
-    kernel = 2 * boundary_band + 1
-    padding = boundary_band
-    dilated = F.max_pool2d(S, kernel_size=kernel, stride=1, padding=padding)
-    dilated = (dilated > 0.0).to(S.dtype)
-    band = torch.clamp(dilated - S, min=0.0)
-    return S + boundary_weight * band
+    if phase == 1 and S_f is not None:
+        return S_f
+    if phase == 2 and E_f is not None:
+        return E_f
+    return torch.ones_like(S_f if S_f is not None else E_f)
 
 
-def ramp_multipliers(step_idx, num_steps, roi_ramp='none', roi_ramp_start=0.5):
-    """Return ``(roi_mult, bg_mult)`` for a progressive ROI-emphasis ramp.
+def code_block_mask(phase, S, E, h, w, threshold=CODE_BLOCK_MASK_THRESHOLD):
+    """Return a binary code-domain block mask ``(B, 1, h, w)``, or None.
 
-    With ``roi_ramp == 'linear'`` the ROI weight scales from
-    ``roi_ramp_start`` at step 1 to ``1.0`` at step ``num_steps``, and the
-    background weight scales inversely. ``none`` keeps both constant.
+    The mask downsamples the *raw* side information (not the feathered masks) to
+    code resolution ``h x w`` via adaptive average pooling and thresholds each
+    block at ``> threshold``, so a block is transmitted iff any object (phase 1)
+    or edge (phase 2) coverage exists in it. Phases 0 and 3 return ``None``
+    (full code map). Using the raw ``S``/``E`` keeps the mask a deterministic
+    pure function of the lossless side information, so the decoder can recompute
+    it identically.
     """
-    if roi_ramp != 'linear' or num_steps <= 1:
-        return 1.0, 1.0
-    t = float(step_idx) / float(num_steps - 1)
-    roi_mult = roi_ramp_start + (1.0 - roi_ramp_start) * t
-    bg_mult = 1.0 + (1.0 - roi_ramp_start) * (1.0 - t)
-    return roi_mult, bg_mult
+    if phase == 1 and S is not None:
+        raw = S
+    elif phase == 2 and E is not None:
+        raw = E
+    else:
+        return None
+    pooled = F.adaptive_avg_pool2d(raw, (h, w))
+    return (pooled > threshold).to(raw.dtype)
 
 
-def region_l1(recon, target, S, E, roi_map,
-              roi_weight=2.0, bg_weight=0.5, edge_weight=0.5,
-              roi_mult=1.0, bg_mult=1.0, eps=1e-8):
-    """Per-sample region loss with a legacy fallback for empty masks.
+def region_l1(recon, target, S_f, E_f,
+              w_roi=1.0, w_edge=1.0, w_bg=1.0, norm='mean1', eps=1e-8,
+              partition='overlap'):
+    """Per-sample region loss with per-phase weights.
 
-    Returns ``(scalar_loss, roi, bg, edge, fallback_count)``. ``scalar_loss`` is
-    a differentiable tensor. ``roi``/``bg``/``edge`` are detached scalar tensors
-    and ``fallback_count`` is a tensor; callers accumulate them and convert to
-    Python numbers only at logging time, so the training loop does not force a
-    GPU sync on every progressive step.
+    ``S_f`` and ``E_f`` are the feathered masks ``(B, 1, H, W)`` (either may be
+    None). The combined weight map is
+
+        w = w_roi * S_f + w_edge * E_f + w_bg * (1 - S_f)        (overlap)
+
+    With ``partition == 'disjoint'`` the regions are mutually exclusive, so
+    "background" strictly means pixels that are neither object nor edge:
+
+        w = w_roi * S_f + w_edge * E_f * (1 - S_f)
+            + w_bg * (1 - S_f) * (1 - E_f)
+
+    With ``norm == 'mean1'`` the loss is the mean-1 weighted mean
+    ``sum(|x - y| * w) / (sum(w) * C + eps)``. With ``norm == 'sum'`` it uses
+    the sum of the ROI/background/edge masked means, and those terms stay
+    connected to the graph.
+
+    A crop uses the region loss when it has an object mask *or* an edge map. A
+    missing ``S_f`` with a present ``E_f`` is replaced by a zero tensor so the
+    edge/background weights still apply. Plain L1 is used only when both maps
+    are empty for that sample.
+
+    Returns ``(scalar_loss, roi, bg, edge, fallback_count)`` where the middle
+    entries are detached tensors for logging. ``fallback_count`` counts samples
+    with neither object nor edge coverage.
     """
     diff = (recon - target).abs()
     channels = recon.size(1)
 
-    def masked_mean(mask):
+    def masked_mean(mask, detach=False):
         num = (diff * mask).sum(dim=(1, 2, 3))
         den = mask.sum(dim=(1, 2, 3)) * channels + eps
-        return num / den
+        value = num / den
+        return value.detach() if detach else value
 
     legacy = diff.mean(dim=(1, 2, 3))
 
-    if S is None:
-        return legacy.mean(), torch.zeros(()), torch.zeros(()), torch.zeros(()), torch.zeros((), dtype=torch.long)
+    if S_f is None and E_f is None:
+        return (legacy.mean(),
+                torch.zeros(()),
+                torch.zeros(()),
+                torch.zeros(()),
+                torch.full((), legacy.numel(), dtype=torch.long))
 
-    roi = masked_mean(roi_map) if roi_map is not None else masked_mean(S)
-    bg = masked_mean(1.0 - S)
-    if E is not None:
-        edge = masked_mean(E)
+    if S_f is None:
+        S_f = torch.zeros_like(E_f)
+
+    w = w_roi * S_f
+    if E_f is not None:
+        if partition == 'disjoint':
+            w = w + w_edge * E_f * (1.0 - S_f)
+            w = w + w_bg * (1.0 - S_f) * (1.0 - E_f)
+        else:
+            w = w + w_edge * E_f
+            w = w + w_bg * (1.0 - S_f)
     else:
-        edge = torch.zeros_like(roi)
+        w = w + w_bg * (1.0 - S_f)
 
-    region = (roi_weight * roi_mult * roi
-              + bg_weight * bg_mult * bg
-              + edge_weight * edge)
+    roi_term = masked_mean(S_f)
+    bg_term = masked_mean(1.0 - S_f)
+    if E_f is not None:
+        edge_term = masked_mean(E_f)
+    else:
+        edge_term = torch.zeros_like(roi_term)
 
-    has_mask = S.sum(dim=(1, 2, 3)) > 0
-    combined = torch.where(has_mask, region, legacy)
+    roi = roi_term.detach()
+    bg = bg_term.detach()
+    edge = edge_term.detach()
+
+    if norm == 'sum':
+        region = w_roi * roi_term + w_edge * edge_term + w_bg * bg_term
+    else:
+        num = (diff * w).sum(dim=(1, 2, 3))
+        den = w.sum(dim=(1, 2, 3)) * channels + eps
+        region = num / den
+
+    has_region = S_f.sum(dim=(1, 2, 3)) > 0
+    if E_f is not None:
+        has_region = has_region | (E_f.sum(dim=(1, 2, 3)) > 0)
+    combined = torch.where(has_region, region, legacy)
 
     return (combined.mean(),
-            roi.detach().mean(),
-            bg.detach().mean(),
-            edge.detach().mean(),
-            (~has_mask).sum().detach())
+            roi.mean(),
+            bg.mean(),
+            edge.mean(),
+            (~has_region).sum().detach())
 
 
-def _vgg_features(device=None):
-    """Lazily build a (cached) VGG16 feature extractor for the perceptual term."""
-    key = str(device) if device is not None else 'cpu'
-    feats = _vgg_cache.get(key)
-    if feats is not None:
-        return feats
+_lpips_cache = {}
 
-    import torchvision
 
-    try:
-        weights = torchvision.models.VGG16_Weights.DEFAULT
-    except AttributeError:
-        weights = None
-    try:
-        vgg = torchvision.models.vgg16(weights=weights)
-    except Exception:
-        vgg = torchvision.models.vgg16(weights=None)
+def _get_lpips(device, net='alex'):
+    """Lazily build (and cache) the official LPIPS model on ``device``."""
+    key = (str(device), net)
+    model = _lpips_cache.get(key)
+    if model is not None:
+        return model
 
-    feats = vgg.features
-    feats.eval()
-    for p in feats.parameters():
+    import lpips as lpips_pkg
+
+    model = lpips_pkg.LPIPS(net=net, spatial=True)
+    model.eval()
+    for p in model.parameters():
         p.requires_grad_(False)
-    if device is not None:
-        feats = feats.to(device)
-    _vgg_cache[key] = feats
-    return feats
+    model = model.to(device)
+    _lpips_cache[key] = model
+    return model
 
 
-# VGG16 feature indices of the ReLU layers used for the perceptual distance.
-_VGG_RELU_INDICES = {
-    'relu1_2': 3,
-    'relu2_2': 8,
-    'relu3_3': 15,
-    'relu4_3': 22,
-    'relu5_3': 29,
-}
+def weighted_lpips(x, y, W, weight=1.0, net='alex'):
+    """Spatially-weighted perceptual loss from the official LPIPS package.
 
-
-def _vgg_layer_activations(feats, x, layers):
-    acts = {}
-    for idx, module in enumerate(feats):
-        x = module(x)
-        if isinstance(module, torch.nn.ReLU):
-            for name, relu_idx in _VGG_RELU_INDICES.items():
-                if name in layers and idx == relu_idx and name not in acts:
-                    acts[name] = x
-    return acts
-
-
-def weighted_lpips(x, y, W, weight=1.0):
-    """Spatially-weighted perceptual loss in VGG feature space.
-
-    ``x`` and ``y`` are RGB images in [0, 1] of shape ``(B, 3, H, W)``. ``W``
-    is a weight map of shape ``(B, 1, H, W)`` (or None). Feature maps are
-    extracted at ``VGG_LAYERS`` and weighted by ``W`` average-pooled to each
-    feature scale. Returns a scalar.
+    ``x`` and ``y`` are RGB images centered in ``[-0.5, 0.5]`` of shape
+    ``(B, 3, H, W)``. The official model expects ``[-1, 1]``, so the inputs are
+    scaled by 2 internally. ``W`` is a weight map ``(B, 1, H, W)`` (or None);
+    the spatial LPIPS map is weighted by ``W`` and reduced to a mask-weighted
+    mean. Returns a scalar.
     """
     if weight == 0.0:
         return torch.zeros((), device=x.device)
 
-    feats = _vgg_features(x.device)
+    model = _get_lpips(x.device, net)
+    d = model(x * 2.0, y * 2.0)  # (B, 1, H, W)
 
-    # ImageNet normalization expected by the pretrained VGG16.
-    mean = torch.tensor(_IMAGENET_MEAN, device=x.device).view(1, 3, 1, 1)
-    std = torch.tensor(_IMAGENET_STD, device=x.device).view(1, 3, 1, 1)
-    x = (x - mean) / std
-    y = (y - mean) / std
+    if W is not None:
+        w_sum = W.sum() + 1e-8
+        d = (d * W).sum() / w_sum
+    else:
+        d = d.mean()
 
-    ax = _vgg_layer_activations(feats, x, set(VGG_LAYERS))
-    ay = _vgg_layer_activations(feats, y, set(VGG_LAYERS))
-
-    total = torch.zeros((), device=x.device)
-    for layer in VGG_LAYERS:
-        if layer not in ax or layer not in ay:
-            continue
-        fx, fy = ax[layer], ay[layer]
-        diff = (fx - fy).norm(2, dim=1, keepdim=True)
-        if W is not None:
-            w = F.adaptive_avg_pool2d(W, (fx.size(2), fx.size(3)))
-            diff = diff * w
-        total = total + diff.mean()
-
-    return weight * total / len(VGG_LAYERS)
+    return weight * d
