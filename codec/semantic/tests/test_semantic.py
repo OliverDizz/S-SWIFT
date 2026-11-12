@@ -20,6 +20,7 @@ import conditioning
 import evaluate
 import semantic_metrics
 import network
+import train_options
 import util
 from mask_codec import code_bitrate_bytes
 
@@ -156,6 +157,26 @@ class TestEdgeOnlyEvaluation(unittest.TestCase):
         self.assertTrue(has_mask)
         self.assertTrue(has_bg)
         self.assertTrue(has_edge)
+
+
+class TestGateDefault(unittest.TestCase):
+    def test_default_gate_mode_is_none(self):
+        args = train_options.parser.parse_args(['--train', 'x', '--eval', 'y'])
+        self.assertEqual(args.gate_mode, 'none')
+
+
+class TestGroupBoundaries(unittest.TestCase):
+    def test_non_monotonic_schedule_is_sorted_by_step(self):
+        schedule = [0, 3, 3, 3, 2, 2, 1, 1, 1, 1]
+        self.assertEqual(
+            evaluate._group_boundaries(schedule, len(schedule)),
+            [1, 4, 6, 10])
+
+    def test_object_first_schedule(self):
+        schedule = [0, 1, 1, 1, 2, 2, 3, 3, 3, 3]
+        self.assertEqual(
+            evaluate._group_boundaries(schedule, len(schedule)),
+            [1, 4, 6, 10])
 
 
 class TestPrefixBytes(unittest.TestCase):
@@ -416,6 +437,14 @@ class TestOfficialLpips(unittest.TestCase):
         x = torch.rand(1, 3, 32, 32) - 0.5
         out = semantic_loss.weighted_lpips(x, x, None, weight=1.0, net='alex')
         self.assertLess(float(out), 1e-3)
+
+    def test_batched_map_matches_single(self):
+        ref = torch.rand(3, 32, 32)
+        dists = [torch.rand(3, 32, 32), torch.rand(3, 32, 32)]
+        batched = semantic_metrics.lpips_map_batch(ref, dists, net='alex')
+        single = semantic_metrics.lpips_map(ref, dists[0], net='alex')
+        self.assertEqual(tuple(batched.shape), (2, 1, 32, 32))
+        self.assertTrue(torch.allclose(batched[0:1], single, atol=1e-5))
 
 
 if __name__ == '__main__':

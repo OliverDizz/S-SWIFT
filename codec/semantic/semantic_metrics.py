@@ -220,29 +220,27 @@ def lpips_map(ref, dist, device=None, net='alex'):
         return model(ref_t, dist_t)
 
 
-def lpips_roi(ref, dist, mask, device=None, net='alex'):
-    """Mask-weighted official LPIPS. None if torch or lpips is unavailable.
+def lpips_map_batch(ref, dists, device=None, net='alex'):
+    """Return spatial LPIPS maps for one reference and several distortions.
 
-    ``ref`` and ``dist`` are RGB images in [0, 1]. ``mask`` is a ``(H, W)``
-    binary map. Returns the mean of the spatial LPIPS map weighted by ``mask``.
+    ``ref`` is an RGB image in [0, 1]. ``dists`` is a sequence of RGB images in
+    [0, 1]. Returns a ``(N, 1, H, W)`` map, or None when torch or lpips is
+    unavailable. This is one batched forward pass, so progressive evaluation
+    does not launch a separate LPIPS forward for every step.
     """
-    if torch is None:
+    if torch is None or not dists:
         return None
     device = _resolve_device(device)
     with torch.no_grad():
         ref_t = _lpips_tensor(ref, device)
-        dist_t = _lpips_tensor(dist, device)
-        mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
-        if mask_t.ndim == 2:
-            mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+        dist_t = torch.cat([_lpips_tensor(d, device) for d in dists], dim=0)
+        if ref_t.shape[0] == 1 and dist_t.shape[0] > 1:
+            ref_t = ref_t.expand(dist_t.shape[0], -1, -1, -1)
         try:
             model = _get_lpips_model(device, net)
         except Exception:
             return None
-        d = model(ref_t, dist_t)  # (1, 1, H, W)
-        w_sum = mask_t.sum() + 1e-8
-        value = (d * mask_t).sum() / w_sum
-    return float(value)
+        return model(ref_t, dist_t)
 
 
 # Optional VGG-L2 diagnostic (kept behind --use-vgg-l2; distinct cache name to
@@ -294,29 +292,36 @@ def _vgg_l2_activations(feats, x):
 
 
 def vgg_l2(ref, dist, device=None):
-    """VGG16 feature-space L2 distance (diagnostic only). None if no torch."""
+    """VGG16 feature-space L2 distance (diagnostic only).
+
+    Best-effort: returns None when torch, torchvision, or the VGG16 weights are
+    unavailable, or when the forward pass fails.
+    """
     if torch is None:
         return None
     device = _resolve_device(device)
-    with torch.no_grad():
-        ref_t = torch.as_tensor(ref, dtype=torch.float32, device=device)
-        dist_t = torch.as_tensor(dist, dtype=torch.float32, device=device)
-        if ref_t.ndim == 3:
-            ref_t = ref_t.unsqueeze(0)
-            dist_t = dist_t.unsqueeze(0)
-        if ref_t.shape[1] == 1:
-            ref_t = ref_t.repeat(1, 3, 1, 1)
-            dist_t = dist_t.repeat(1, 3, 1, 1)
-        mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-        std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
-        feats = _get_vgg_l2_features(device)
-        a_ref = _vgg_l2_activations(feats, (ref_t - mean) / std)
-        a_dist = _vgg_l2_activations(feats, (dist_t - mean) / std)
-        total = 0.0
-        for layer in _VGG_L2_LAYERS:
-            d = (a_ref[layer] - a_dist[layer]).norm(2, dim=1).mean()
-            total = total + float(d)
-    return total / len(_VGG_L2_LAYERS)
+    try:
+        with torch.no_grad():
+            ref_t = torch.as_tensor(ref, dtype=torch.float32, device=device)
+            dist_t = torch.as_tensor(dist, dtype=torch.float32, device=device)
+            if ref_t.ndim == 3:
+                ref_t = ref_t.unsqueeze(0)
+                dist_t = dist_t.unsqueeze(0)
+            if ref_t.shape[1] == 1:
+                ref_t = ref_t.repeat(1, 3, 1, 1)
+                dist_t = dist_t.repeat(1, 3, 1, 1)
+            mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+            std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
+            feats = _get_vgg_l2_features(device)
+            a_ref = _vgg_l2_activations(feats, (ref_t - mean) / std)
+            a_dist = _vgg_l2_activations(feats, (dist_t - mean) / std)
+            total = 0.0
+            for layer in _VGG_L2_LAYERS:
+                d = (a_ref[layer] - a_dist[layer]).norm(2, dim=1).mean()
+                total = total + float(d)
+        return total / len(_VGG_L2_LAYERS)
+    except Exception:
+        return None
 
 
 def psnr_masked(ref, dist, mask):

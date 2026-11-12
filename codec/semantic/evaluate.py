@@ -16,8 +16,8 @@ from util import (eval_forward, evaluate_psnr, get_models, set_eval,
 from torchvision import transforms
 from dataset import get_loader
 from mask_codec import bitrate_bytes, code_bitrate_bytes
-from semantic_metrics import vmaf, lpips, lpips_map
-from semantic_metrics import psnr_masked, msssim_bbox, lpips_roi
+from semantic_metrics import vmaf, lpips, lpips_map_batch, vgg_l2
+from semantic_metrics import psnr_masked, msssim_bbox
 
 EvalResult = namedtuple('EvalResult', [
     'loss', 'msssim', 'psnr', 'psnr_ee1', 'psnr_ee2', 'psnr_ee3', 'psnr_ee4',
@@ -25,7 +25,7 @@ EvalResult = namedtuple('EvalResult', [
     'psnr_roi', 'psnr_bg', 'psnr_edge', 'msssim_bbox',
     'lpips_roi', 'lpips_bg', 'lpips_edge', 'lpips_full',
     'mask_bytes', 'edge_bytes', 'mask_iou', 'edge_f1',
-    'vmaf', 'lpips', 'total_bytes_per_frame',
+    'vmaf', 'lpips', 'vgg_l2', 'total_bytes_per_frame',
     'prefix_visual_bytes_raw', 'prefix_visual_bytes', 'prefix_total_bytes',
 ])
 
@@ -97,10 +97,10 @@ def _prefix_visual_bytes_compressed(code_full, iterations, bits):
     slots after ``s`` are zeroed so their positions are omitted, then the whole
     prefix map is compressed. The result is non-decreasing in ``s``.
     """
+    prefix = np.zeros_like(code_full)
     out = []
     for s in range(iterations):
-        prefix = np.zeros_like(code_full)
-        prefix[:(s + 1) * bits] = code_full[:(s + 1) * bits]
+        prefix[s * bits:(s + 1) * bits] = code_full[s * bits:(s + 1) * bits]
         out.append(float(code_bitrate_bytes(prefix)))
     return np.asarray(out, dtype=np.float64)
 
@@ -201,36 +201,46 @@ def _region_flags(mask, edge):
     return has_mask, has_bg, has_edge
 
 
-def _lpips_regions(ref, dist, mask, edge, device, net):
-    """Return (full, roi, bg, edge) official LPIPS scalars from one map.
+def _lpips_regions(ref, dists, mask, edge, device, net):
+    """Return per-step (full, roi, bg, edge) LPIPS scalar lists.
 
+    ``ref`` is one reference image and ``dists`` is the list of progressive
+    reconstructions. All steps are scored in one batched LPIPS forward pass.
     ``mask`` and ``edge`` are raw (unfeathered) ``(1, 1, H, W)`` tensors.
     Region scalars are NaN when the region is empty.
     """
-    dmap = lpips_map(ref, dist, device=device, net=net)
+    dmap = lpips_map_batch(ref, dists, device=device, net=net)
     if dmap is None:
         return None, None, None, None
-    full = float(dmap.mean())
 
-    def masked(m):
+    def masked(step_map, m):
         total = m.sum()
         if float(total) <= 0.0:
             return np.nan
-        return float((dmap * m).sum() / total)
+        return float((step_map * m).sum() / total)
 
-    roi = masked(mask)
-    bg = masked(1.0 - mask)
-    edge_value = masked(edge)
-    return full, roi, bg, edge_value
+    full, roi, bg, edge_values = [], [], [], []
+    for step in range(dmap.shape[0]):
+        step_map = dmap[step:step + 1]
+        full.append(float(step_map.mean()))
+        roi.append(masked(step_map, mask))
+        bg.append(masked(step_map, 1.0 - mask))
+        edge_values.append(masked(step_map, edge))
+    return full, roi, bg, edge_values
 
 
 def _group_boundaries(phase_schedule, num_steps):
-    """Return the last 1-based step index of each phase group."""
+    """Return the last 1-based step index of each phase group.
+
+    The list is sorted by step so cumulative-gain accumulation follows
+    progression order even when the phase schedule is non-monotonic (for
+    example the ROI-late D-grouping schedule ``0,3,3,3,2,2,1,1,1,1``).
+    """
     boundaries = []
     for phase in sorted(set(phase_schedule)):
         idx = max(i for i, p in enumerate(phase_schedule) if p == phase)
         boundaries.append(idx + 1)
-    return boundaries
+    return sorted(boundaries)
 
 
 def _object_complete_step(phase_schedule, num_steps):
@@ -331,7 +341,7 @@ def run_eval(model, eval_loader, args, output_suffix='',
   all_lpips_roi, all_lpips_bg, all_lpips_edge, all_lpips_full = [], [], [], []
   all_mask_bytes, all_edge_bytes, all_visual_bytes = [], [], []
   all_prefix_raw, all_prefix_visual, all_prefix_total = [], [], []
-  all_vmaf, all_lpips = [], []
+  all_vmaf, all_lpips, all_vgg_l2 = [], [], []
   any_mask = False
   any_edge = False
   semantic_enabled = bool(
@@ -410,14 +420,15 @@ def run_eval(model, eval_loader, args, output_suffix='',
           prefix_raw_by_ex = [None] * batch_size
           prefix_comp_by_ex = [None] * batch_size
           visual_by_ex = [None] * batch_size
+          final_lpips_by_ex = [None] * batch_size
           if code_batch.size > 0:
             for ex in range(batch_size):
               code_full = code_batch[-1, ex]
-              visual_by_ex[ex] = float(code_bitrate_bytes(code_full))
               prefix_raw_by_ex[ex] = _slot_visual_bytes(
                   code_full, args.iterations, args.bits)
               prefix_comp_by_ex[ex] = _prefix_visual_bytes_compressed(
                   code_full, args.iterations, args.bits)
+              visual_by_ex[ex] = float(prefix_comp_by_ex[ex][-1])
 
           mask_bytes_by_ex = [0.0] * batch_size
           edge_bytes_by_ex = [0.0] * batch_size
@@ -442,22 +453,22 @@ def run_eval(model, eval_loader, args, output_suffix='',
                                          device=batch.device).view(1, 1, *mask.shape)
                 edge_t = torch.as_tensor(edge, dtype=torch.float32,
                                          device=batch.device).view(1, 1, *edge.shape)
-                lpips_full_steps, lpips_roi_steps = [], []
-                lpips_bg_steps, lpips_edge_steps = [], []
-                for step in range(num_steps):
-                  full, roi, bg, edge_value = _lpips_regions(
-                      original[ex], out_imgs[step][ex],
-                      mask_t, edge_t, batch.device, lpips_net)
-                  if full is None:
-                    lpips_full_steps.append(np.nan)
-                    lpips_roi_steps.append(np.nan)
-                    lpips_bg_steps.append(np.nan)
-                    lpips_edge_steps.append(np.nan)
-                  else:
-                    lpips_full_steps.append(full)
-                    lpips_roi_steps.append(roi if has_mask else np.nan)
-                    lpips_bg_steps.append(bg if has_bg else np.nan)
-                    lpips_edge_steps.append(edge_value if has_edge else np.nan)
+                lpips_full_values, lpips_roi_values, lpips_bg_values, lpips_edge_values = _lpips_regions(
+                    original[ex], list(out_imgs[:, ex]),
+                    mask_t, edge_t, batch.device, lpips_net)
+                if lpips_full_values is None:
+                  lpips_full_values = [np.nan] * num_steps
+                  lpips_roi_values = [np.nan] * num_steps
+                  lpips_bg_values = [np.nan] * num_steps
+                  lpips_edge_values = [np.nan] * num_steps
+                lpips_full_steps = lpips_full_values
+                lpips_roi_steps = [value if has_mask else np.nan
+                                   for value in lpips_roi_values]
+                lpips_bg_steps = [value if has_bg else np.nan
+                                  for value in lpips_bg_values]
+                lpips_edge_steps = [value if has_edge else np.nan
+                                    for value in lpips_edge_values]
+                final_lpips_by_ex[ex] = lpips_full_steps[-1]
                 all_lpips_full.append(lpips_full_steps)
                 if has_mask:
                   all_lpips_roi.append(lpips_roi_steps)
@@ -513,10 +524,19 @@ def run_eval(model, eval_loader, args, output_suffix='',
 
           if getattr(args, 'use_lpips', False):
             for ex in range(original.shape[0]):
-              value = lpips(original[ex], out_imgs[-1][ex],
-                            device=batch.device)
+              value = final_lpips_by_ex[ex]
+              if value is None or not np.isfinite(value):
+                value = lpips(original[ex], out_imgs[-1][ex],
+                              device=batch.device)
+              if value is not None and np.isfinite(value):
+                all_lpips.append(float(value))
+
+          if getattr(args, 'use_vgg_l2', False):
+            for ex in range(original.shape[0]):
+              value = vgg_l2(original[ex], out_imgs[-1][ex],
+                             device=batch.device)
               if value is not None:
-                all_lpips.append(value)
+                all_vgg_l2.append(value)
 
       if i % 10 == 0:
         print('\tevaluating iter %d (%f seconds)...' % (
@@ -531,6 +551,7 @@ def run_eval(model, eval_loader, args, output_suffix='',
   visual_bytes = float(np.mean(all_visual_bytes)) if all_visual_bytes else None
   vmaf_mean = float(np.mean(all_vmaf)) if all_vmaf else None
   lpips_mean = float(np.mean(all_lpips)) if all_lpips else None
+  vgg_l2_mean = float(np.mean(all_vgg_l2)) if all_vgg_l2 else None
 
   psnr_roi = np.array(all_psnr_roi).mean(axis=0) if all_psnr_roi else None
   psnr_bg = np.array(all_psnr_bg).mean(axis=0) if all_psnr_bg else None
@@ -588,6 +609,7 @@ def run_eval(model, eval_loader, args, output_suffix='',
       edge_f1,
       vmaf_mean,
       lpips_mean,
+      vgg_l2_mean,
       total_bytes,
       prefix_raw,
       prefix_visual,

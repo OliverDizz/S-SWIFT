@@ -31,7 +31,7 @@ when the README and the code disagree.
 
 | Path | Purpose |
 | --- | --- |
-| `flows/` | Extracts motion vectors with a bundled FFmpeg 2.7.2 and OpenCV code. It writes `_before_flow_x/y` and `_after_flow_x/y` images for the codec. |
+| `flows/` | Extracts motion vectors. It contains bundled FFmpeg 2.7.2 sources and OpenCV code; `scripts/02_motion_vectors.sh` builds `extract_mvs` against `mv_env` FFmpeg 2.8.6. It writes `_before_flow_x/y` and `_after_flow_x/y` images for the codec. |
 | `codec/src/` | Main hierarchical P-frame codec. It contains DDP training, evaluation, TensorBoard logging, the encoder, the decoder, the early-exit decoder, and progressive binary codes. |
 | `codec/src/training_experiments.ipynb` | Standard notebook for the three base-codec hierarchy trainings. It launches DDP training and records TensorBoard events. |
 | `codec/semantic/` | Semantic Swift codec. It is an implemented copy of `codec/src/` plus SAM3 mask and Canny edge side-information. Its standard training flow is `codec/semantic/semantic_experiments.ipynb`. |
@@ -133,11 +133,12 @@ warped features. See `get_flows()`, `warp_unet_outputs()`, and `prepare_inputs()
 `codec/src/util.py`.
 
 Missing motion-vector files produce zero-filled motion and a warning. These gaps
-are largely deterministic: the bundled ffmpeg 2.8.6 + `MotionVector` pipeline
-drops long-distance motion vectors (mostly the 6-frame and 3-frame references)
-on clips with large motion, so re-running `02_motion_vectors.sh` does not fill
-them. They affect ~0.1% of flow files (681/10,000 clips have at least one) and
-are zero-filled by the codec, so the impact on training is small.
+are largely deterministic: the bundled FFmpeg 2.7.2 `extract_mvs` source, built
+against `mv_env` FFmpeg 2.8.6, drops long-distance motion vectors (mostly the
+6-frame and 3-frame references) on clips with large motion, so re-running
+`02_motion_vectors.sh` does not fill them. 681 of 10,000 clips have at least one
+missing flow file; the missing files are a small fraction (~0.1%) of all flow
+files. The codec zero-fills them, so the impact on training is small.
 `scripts/05_fix_motion_vectors.py` audits the gaps and re-extracts incomplete
 clips.
 
@@ -209,8 +210,9 @@ channels `[0, 1, 2, 6, 7, 8]`, so `S` and `E` never enter the context U-Net.
 
 The mask and edge layers are lossless in this version. `mask_codec.py` packs
 them with `np.packbits` and `np.savez_compressed`. Evaluation reports their cost
-as bytes per frame. `mask_iou()` and `edge_f1()` in `semantic_metrics.py` are
-placeholders and are not used yet.
+as bytes per frame. `semantic_metrics.py` provides `mask_iou()` and `edge_f1()`,
+but evaluation does not call them yet: it reports `1.0` when the corresponding
+map is present.
 
 The visual loss has two modes selected by `--loss-mode`:
 
@@ -246,18 +248,22 @@ The visual loss has two modes selected by `--loss-mode`:
   the graph. A crop uses the region loss when it has an object mask *or* an edge
   map. A missing `S_f` with a present `E_f` becomes a zero tensor, so the edge
   and background weights still apply. Plain L1 is used only when both maps are
-  empty for that sample. Phase 1 still gates on `S_f`, so an edge-only crop does
-  not update the object phase; phase 2 gates on `E_f` and applies the edge
-  weights.
+  empty for that sample. With `--gate-mode mask`, phase 1 gates on `S_f`, so an
+  edge-only crop does not update the object phase; phase 2 gates on `E_f` and
+  applies the edge weights.
   `--region-partition` defaults to `overlap`. The fallback fix changes every
-  region ablation (B, C, D, D-soft, D-grouping, D-Strong). Existing B/C/D
-  checkpoints used the old fallback. Retrain D as the control for D-Strong and
-  treat B as an old-fallback checkpoint until it is retrained.
+  region ablation (B, C, D, D-soft, D-grouping, D-Strong). Existing B/D
+  checkpoints, and any C run before the fix, used the old fallback. Retrain D as
+  the control for D-Strong and treat B as an old-fallback checkpoint until it is
+  retrained. D-Strong runs started after the fix use the current fallback. An A
+  run that does not record `--gate-mode none` was trained with the old `mask`
+  default and is not a clean ungated baseline.
 
-The perceptual term uses the official `lpips` package (AlexNet, spatial map),
-not VGG-L2. `--lpips-scope` (`full`/`roi`) and `--lpips-steps`
-(`final`/`last3`/`all`) control the LPIPS term. `--lpips-net` selects `alex` or
-`vgg`. `--use-vgg-l2` adds the older VGG-L2 distance as a diagnostic metric.
+The perceptual term uses the official `lpips` package with a spatial map, not
+the older VGG-L2 feature distance. `--lpips-scope` (`full`/`roi`) and
+`--lpips-steps` (`final`/`last3`/`all`) control the LPIPS term. `--lpips-net`
+selects the `alex` or `vgg` LPIPS backbone. `--use-vgg-l2` adds the older VGG-L2
+distance as an eval-only diagnostic at the final step.
 
 `--use-conditioning` adds conditioning that reads `(S, E)` and does not change
 the input channels of existing layers. `--conditioning-mode legacy` uses a
@@ -280,10 +286,15 @@ for the per-prefix ramp and the total bytes (`code_bitrate_bytes` in
 `mask_codec.py`). The `.codes` files are still written full; the sparse layout is
 not materialized in a file because nothing in the repo decodes `.codes` files.
 
+The `--gate-mode` default is `none`. D, D-grouping, D-Strong, and
+D-Strong+Bit-Alloc pass `--gate-mode mask`; A, B, C, and D-soft pass `none`.
+This keeps A and other legacy runs ungated because the dataset always supplies
+zero-filled `S`/`E` channels, even when no mask arguments are given.
+
 The ablation ladder is:
 
-- **A** (`A*`): baseline. No mask or edge arguments. Legacy loss. No LPIPS. Its
-  early-exit path matches `codec/src/` (see below).
+- **A** (`A*`): baseline. No mask or edge arguments. Legacy loss. No LPIPS. No
+  gating. Its early-exit path matches `codec/src/` (see below).
 - **B**: region loss (`--loss-mode region`, `--region-norm mean1`) plus official
   LPIPS. No conditioning. No gating. A flat phase schedule.
 - **C**: B plus spatial conditioning (`--use-conditioning`,
@@ -291,7 +302,8 @@ The ablation ladder is:
 - **D**: C plus residual gating (`--gate-mode mask`) and the object-first phase
   schedule (`--phase-schedule 0,1,1,1,2,2,3,3,3,3`).
 - **D-soft**: C plus the object-first phase schedule with `--gate-mode none`.
-- **D-grouping**: D with the ROI-late phase schedule (`0,3,3,3,2,2,1,1,1,1`).
+- **D-grouping**: D with the ROI-late phase schedule (`0,3,3,3,2,2,1,1,1,1`)
+  and ROI-late weights.
 - **D-Strong**: a tuned object-first proposal. Disjoint three-way partition
   (`--region-partition disjoint`), object weights `1,8,1,0.3`, background
   `1,0.1,0.5,1`, `--gate-feather 1`, `--lpips-scope roi`, and the balanced phase
@@ -311,6 +323,10 @@ from B with `--load-strict false`; the zero-init conditioning heads keep C
 identical to B at step 0. Load D-soft and D-grouping from C with
 `--load-strict true`; gating and the phase schedule do not add parameters. A
 single-run resume (same `--model-dir`) uses `--load-model-name`/`--load-iter`.
+Set either `RESUME_FROM` or `LOAD_MODEL_DIR`, not both; the notebook raises if
+both are set. The B, C, D-soft, and D-grouping cells hardcode level 0 warm-start
+sources. For levels 1 and 2, set `LOAD_MODEL_DIR` to the matching source model
+directory before the run.
 
 #### Early-exit path and LR schedule
 
@@ -367,31 +383,33 @@ the phase schedule and the disjoint/overlap partition, the gate helpers, the
 `code_block_mask` code-domain mask, and the official-LPIPS term),
 `conditioning.py` (`MaskAdd`, `FiLM`, and `SpatialFiLM`), `mask_codec.py`
 (lossless mask/edge bytes via `bitrate_bytes`, and sparse code accounting via
-`code_bitrate_bytes`), and `semantic_metrics.py` (VMAF, official LPIPS scalars
-and the spatial LPIPS map, and the ROI metrics `psnr_masked`, `bbox_from_mask`,
-`msssim_bbox`, `lpips_roi`; IoU/F1 are still placeholders).
-`--use-vmaf` and `--use-lpips` add eval-only metrics and are best-effort. They
-return `None` or print nothing when the optional backend is missing.
+`code_bitrate_bytes`), and `semantic_metrics.py` (VMAF, official LPIPS scalars,
+`lpips_map`/`lpips_map_batch`, best-effort VGG-L2, and the ROI metrics
+`psnr_masked`, `bbox_from_mask`, and `msssim_bbox`).
+`--use-vmaf`, `--use-lpips`, and `--use-vgg-l2` add eval-only metrics and are
+best-effort. They return `None` or print nothing when the optional backend is
+missing.
 
 Evaluation reports, per progressive step and per region (full, ROI, background,
 edge): PSNR, MS-SSIM (full frame and bbox-ROI), and official LPIPS. It also
 reports per-early-exit PSNR and MS-SSIM, per-prefix byte counts, mask and edge
-bytes per frame, and `total_bytes_per_frame`. ROI and edge metrics use the raw
+bytes per frame, `total_bytes_per_frame`, and optional VGG-L2 at the final
+step. ROI and edge metrics use the raw
 `S`/`E` maps, not the feathered maps, so they are comparable across
 `--gate-feather` values. A sample is skipped only when both maps are empty. Edge
 PSNR and LPIPS-edge include edge-only samples; ROI, background, and bbox metrics
 need a nonempty object mask. A run with no mask and no edge (ablation A) reports
 those metrics as `None`. Prefix accounting has three fields:
-`prefix_visual_bytes_raw` (cumulative packed bits), `prefix_visual_bytes`
-(cumulative DEFLATE code bytes, matching `code_bitrate_bytes`), and
-`prefix_total_bytes` (compressed code bytes plus mask and edge bytes). The
-totals are per-sample means over all evaluated samples.
+`prefix_visual_bytes_raw` (cumulative raw packed bytes before compression),
+`prefix_visual_bytes` (cumulative DEFLATE code bytes, matching
+`code_bitrate_bytes`), and `prefix_total_bytes` (compressed code bytes plus mask
+and edge bytes). The totals are per-sample means over all evaluated samples.
 `--best-metric` (`last`/`mean`/`max`/`psnr+msssim`) picks the checkpoint
 criterion. New runs use `psnr+msssim`. Standalone evaluation accepts
 `"best"` as the iteration. Report the final 20,000 checkpoint as the headline
 number and the best checkpoint as a secondary result.
 `print_hierarchy_summary` prints the per-step delta table, the group-boundary
-gains, raw prefix bytes, and compressed prefix bytes.
+gains in step order, raw prefix bytes, and compressed prefix bytes.
 
 Do not modify or vendor `external/sam3`. Treat it as an external dependency.
 
@@ -431,7 +449,9 @@ notebook does these steps:
    it imports PyTorch.
 2. Sets `HIERARCHIES`, `ABLATION` (`A`, `B`, `C`, `D`, `D-soft`,
    `D-grouping`, `D-Strong`, or `D-Strong+Bit-Alloc`), `SEED`, `RUN_LEVELS`,
-   and the loss, metric, and LR flags. `set_quick_test()` keeps the derived
+   and the loss, metric, and LR flags. `semantic_arguments()` derives the gate
+   mode from the ablation: only D, D-grouping, D-Strong, and
+   D-Strong+Bit-Alloc use `mask`. `set_quick_test()` keeps the derived
    iteration counts and LR schedule consistent. `configure_ablation()` sets the
    D-Strong globals so the two D-Strong cells cannot drift.
 3. Runs the mask/edge inspection cell. Run this cell before a long training.
@@ -443,22 +463,28 @@ notebook does these steps:
    Each `run_training` call gets its own timestamped folder, so re-runs do not
    overwrite earlier results. Set `RUN_TAG` to pin a fixed folder, or pass
    `EVAL_RUN_TAG`/`SUMMARY_RUN_TAG` to evaluate an earlier run.
-   `run_config.json` records the args, seed, git SHA, hostname, and creation
-   time. A stale config with different args or metadata raises an error. A full
-   D-Strong run also asserts that `LOAD_MODEL_DIR`, `RESUME_FROM`, and `RUN_TAG`
-   are unset.
+   `run_config.json` records the full training argv, the base args, seed, git
+   SHA, dirty-worktree state, hostname, and creation time. A stale config with
+   different args or metadata raises an error; configs from before this change
+   are treated as legacy and only their args are checked. A resume ignores the
+   continuation flags (`--load-model-name`, `--load-iter`, and the resume
+   TensorBoard directory) when comparing the recipe, so continuing the same run
+   does not look like a config change. A full D-Strong run also asserts that
+   `LOAD_MODEL_DIR`, `RESUME_FROM`, and `RUN_TAG` are unset.
 7. Loads a saved checkpoint and runs standalone evaluation. The evaluation cell
    uses `EVAL_ABLATION` to select the ablation and evaluates `None` (latest) and
    `"best"`. The full-grid cell is disabled because it reused the previous
    ablation's globals.
 
-Set `QUICK_TEST = True` for a short check; the D-Strong cells then train only
-level 0. The notebook passes `--mp-context spawn`, `--eval-stride 8`, and the
-LR flags. In-training evaluation uses `--eval-ee-msssim final` and
-`--eval-bbox-msssim final` to bound evaluation time; standalone evaluation
-computes every step. Run the standalone evaluation cell only after the selected
-hierarchy trainings finish. An evaluation between trainings keeps a model and
-CUDA-cached memory alive during the next training.
+Call `set_quick_test(True)` for a short check; the D-Strong cells then train
+only level 0. Do not change `QUICK_TEST` without re-running the config cell,
+because the derived iteration counts and LR schedule are set there. The
+notebook passes `--mp-context spawn` and uses `EVAL_STRIDE_IN_TRAIN = 32`;
+standalone evaluation uses `EVAL_STRIDE = 8`. In-training evaluation uses
+`--eval-ee-msssim final` and `--eval-bbox-msssim final` to bound evaluation
+time; standalone evaluation computes every step. Run the standalone evaluation
+cell only after the selected hierarchy trainings finish. An evaluation between
+trainings keeps a model and CUDA-cached memory alive during the next training.
 
 ### Distributed training
 
@@ -486,10 +512,18 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 - For the base codec, TensorBoard events accumulate in
   `experiments/hierarchy_<level>/tensorboard/`.
 - `save_best()` writes `*_best.pth` when the `--best-metric` score improves.
-- `RESUME_FROM` continues a level from a saved checkpoint.
+- `RESUME_FROM` continues a level from a saved checkpoint. Do not combine it
+  with `LOAD_MODEL_DIR`; the notebook raises if both are set.
 - `latest_iteration()` ignores `*_best.pth` files because `best` is not an
   integer. Standalone evaluation still accepts `iteration="best"` and loads
   `{prefix}_{net}_best.pth` directly.
+- `semantic_inference.py` selects the newest run whose `train.log` contains
+  `Training done.` and prints the resolved tag. If only incomplete runs exist,
+  it raises; set `RUN_TAG` (and `CHECKPOINT_ITER` when needed) to override.
+- `semantic_inference.py` prefers `run_config.json` for the trained flags. The
+  D-soft, D-grouping, D-Strong, and D-Strong+Bit-Alloc variants fail if their
+  model directory has no config; their built-in fallbacks cover the architecture
+  but not a missing provenance file.
 - The semantic notebook writes `train.log`, `hierarchy<level>_<net>_<iter>.pth`,
   TensorBoard events, packed codes, and probe images under a timestamped run
   directory `codec/semantic/experiments/hierarchy_<level>/<ABLATION>/<run_tag>/`.
@@ -497,6 +531,9 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
   `tensorboard/`, and `train.log` subtree. Ablations and repeat runs do not
   overwrite each other. The checkpoint prefix stays `hierarchy<level>`. The
   pre-repair A/B/C runs moved to `codec/semantic/old_experiments/`.
+- Reusing an old checkpoint for evaluation is safe. Do not compare runs trained
+  with different loss or gate code. Check `run_config.json` and `train.log`
+  before you reuse an old result.
 - In the semantic notebook, `--save-codes` writes packed code files under
   `output/<suffix>/codes/`. `--save-out-img` is accepted, but `evaluate.py` does
   not dump per-frame images. Evaluation always writes one probe frame per run
@@ -504,8 +541,8 @@ The DDP wrappers use `find_unused_parameters=True`. `unet.py` defines an unused
 - Semantic evaluation reports, per step, plain and per-region (ROI, background,
   edge) PSNR, full-frame and bbox-ROI MS-SSIM, official LPIPS, the four
   early-exit PSNRs and MS-SSIMs, per-prefix raw and compressed byte counts,
-  mask and edge bytes per frame, and optional VMAF. ROI and edge metrics use
-  the raw maps; edge metrics include edge-only samples.
+  mask and edge bytes per frame, and optional VMAF and VGG-L2. ROI and edge
+  metrics use the raw maps; edge metrics include edge-only samples.
 
 ### Performance notes
 
@@ -566,7 +603,7 @@ The tree also keeps legacy six-level settings: `quality_levels_old`,
 - It logs played quality and update actions.
 - It loops the trace when the trace ends.
 
-`Environment.get_video_chunk()` (`streamer/simulator.py:147-452`) has two modes:
+`Environment.get_video_chunk()` (`streamer/simulator.py`) has two modes:
 
 - `next_or_regret == 0`: download the next chunk at the requested quality.
 - `next_or_regret > 0`: upgrade a chunk that is already in the buffer.
@@ -604,8 +641,8 @@ The code uses eight feature rows:
 - The last four actions are automatic "fill" actions. They select a good chunk to
   upgrade from the neighboring qualities.
 
-A chunk can receive at most two upgrades. The action mask in `streamer/net.py:337-355`
-enforces this limit.
+A chunk can receive at most two upgrades. The action mask in
+`streamer/net.py:compute_mask()` enforces this limit.
 
 ### Reward
 
@@ -701,13 +738,14 @@ take the argmax. Therefore test results are stochastic.
   `codec/semantic/`.
 - Preserve semantic checkpoint compatibility when you change the architecture.
   The early-exit path matches `codec/src/`, so the pre-repair A/B/C checkpoints
-  load again. A and B share keys. C adds the `mask_add` and `film*` keys, so
-  strict resume fails across the A/B-to-C boundary. Warm-start B from A with
+  load again. A and the base of B share keys; B adds the zero-initialized
+  `extra_*` refinement keys. C adds the `mask_add` and `film*` keys, so strict
+  resume fails across the A/B-to-C boundary. Warm-start B from A with
   `--load-model-dir` and `--load-strict false`; the refinement heads are
   zero-initialized. Warm-start C from B with `--load-strict false`; the
   conditioning heads are zero-initialized. Warm-start D-soft and D-grouping from
   C with `--load-strict true`. D, D-Strong, and D-Strong+Bit-Alloc train from
-  scratch.
+  scratch. Do not combine a warm start with `RESUME_FROM`.
 - Do not commit `codec/semantic/experiments/`,
   `codec/semantic/old_experiments/`, checkpoints, logs, TensorBoard events,
   packed `.codes` files, or probe images.
@@ -733,10 +771,10 @@ take the argmax. Therefore test results are stochastic.
     with `--max-train-iters 20`, `--eval-iters 15`, `--num-workers 2`, and
     `--mp-context spawn`. Check the exit code, the loss lines, and the best
     checkpoint.
-  - For the semantic codec, compile the changed modules and run the notebook with
-    `QUICK_TEST = True` on level 0. Run the mask/edge inspection cell first. Check
-    the loss lines, the mask and edge byte counts, the ROI scalars, and the best
-    checkpoint. Run the lightweight unit tests with
+  - For the semantic codec, compile the changed modules and run the notebook
+    with `set_quick_test(True)` on level 0. Run the mask/edge inspection cell
+    first. Check the loss lines, the mask and edge byte counts, the ROI scalars,
+    and the best checkpoint. Run the lightweight unit tests with
     `python -m unittest tests.test_semantic -v` from `codec/semantic/`.
   - For the streamer, run a short `test_grad.py` call against one trace. Then check the
     logs and the reward.

@@ -76,31 +76,16 @@ parser.add_argument('--lpips-weight', type=float, default=0.1,
 parser.add_argument('--loss-mode', type=str, default='legacy',
                     choices=['legacy', 'region'],
                     help='legacy = current W path; region = explicit ROI/bg/edge loss.')
-parser.add_argument('--roi-weight', type=float, default=2.0,
-                    help='Weight of the ROI term in region mode.')
-parser.add_argument('--bg-weight', type=float, default=0.5,
-                    help='Weight of the background term in region mode.')
-parser.add_argument('--edge-weight', type=float, default=0.5,
-                    help='Weight of the edge term in region mode.')
-parser.add_argument('--boundary-band', type=int, default=0,
-                    help='Pixels; 0 = hard S, >0 = boost a dilated boundary band.')
-parser.add_argument('--boundary-weight', type=float, default=0.5,
-                    help='Extra weight for the boundary band.')
-parser.add_argument('--roi-ramp', type=str, default='none',
-                    choices=['none', 'linear'],
-                    help='none or linear; ramp ROI emphasis across progressive steps.')
-parser.add_argument('--roi-ramp-start', type=float, default=0.5,
-                    help='ROI weight multiplier at step 1 when roi-ramp=linear.')
 
 ######## Semantic hierarchy / residual gating ########
 parser.add_argument('--phase-schedule', type=_int_list,
                     default=[0, 1, 1, 1, 2, 2, 3, 3, 3, 3],
                     help='Comma-separated phase per progressive step '
                          '(0=coarse, 1=ROI, 2=edge, 3=background).')
-parser.add_argument('--gate-mode', type=str, default='mask',
+parser.add_argument('--gate-mode', type=str, default='none',
                     choices=['none', 'mask'],
-                    help='mask = gate the encoder residual by the phase mask; '
-                         'none = no gating.')
+                    help='none = no gating (baseline); mask = gate the encoder '
+                         'residual by the phase mask (D ablations).')
 parser.add_argument('--gate-feather', type=int, default=2,
                     help='Dilate+blur pixels applied to S and E (0 = hard gate).')
 parser.add_argument('--w-roi', type=_float_list,

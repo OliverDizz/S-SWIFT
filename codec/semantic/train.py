@@ -629,6 +629,7 @@ def main():
                     total_bytes = result.total_bytes_per_frame
                     vmaf_mean = result.vmaf
                     lpips_mean = result.lpips
+                    vgg_l2_mean = result.vgg_l2
                     prefix_raw = result.prefix_visual_bytes_raw
                     prefix_visual = result.prefix_visual_bytes
                     prefix_total = result.prefix_total_bytes
@@ -677,6 +678,8 @@ def main():
                             print('%s VMAF : %.4f' % (eval_name, vmaf_mean))
                         if lpips_mean is not None:
                             print('%s LPIPS: %.4f' % (eval_name, lpips_mean))
+                        if vgg_l2_mean is not None:
+                            print('%s VGG-L2: %.4f' % (eval_name, vgg_l2_mean))
 
                         for step_idx in range(len(eval_loss)):
                             step = step_idx + 1
@@ -753,6 +756,9 @@ def main():
                         if lpips_mean is not None:
                             log_scalar('eval/%s/lpips' % eval_name,
                                        lpips_mean, train_iter)
+                        if vgg_l2_mean is not None:
+                            log_scalar('eval/%s/vgg_l2' % eval_name,
+                                       vgg_l2_mean, train_iter)
                         if prefix_raw is not None:
                             for pidx in range(len(prefix_raw)):
                                 log_scalar('eval/%s/prefix_raw_bytes_l%02d'

@@ -84,12 +84,31 @@ def _has_legacy_run(level, ablation):
             / "model").is_dir()
 
 
+def _run_is_complete(level, ablation, tag):
+    """True when the training log reached the normal end of the run."""
+    log_path = (_experiment_root() / f"hierarchy_{level}" / ablation
+                / tag / "train.log")
+    if not log_path.is_file():
+        return False
+    try:
+        return "Training done." in log_path.read_text(errors="replace")
+    except OSError:
+        return False
+
+
 def resolve_run_tag(level, ablation):
     if RUN_TAG is not None:
         return RUN_TAG
     existing = _existing_run_tags(level, ablation)
+    complete = [tag for tag in existing
+                if _run_is_complete(level, ablation, tag)]
+    if complete:
+        return complete[-1]
     if existing:
-        return existing[-1]
+        raise FileNotFoundError(
+            f"no complete run for hierarchy {level} / ablation {ablation}; "
+            f"newest {existing[-1]} is incomplete. Set RUN_TAG explicitly "
+            "if you really want that checkpoint.")
     if _has_legacy_run(level, ablation):
         return LEGACY_RUN_TAG
     raise FileNotFoundError(
@@ -135,21 +154,28 @@ def build_args(level, frames, mv, masks, edges):
         "--decoder-fuse-level", str(cfg["decoder_fuse_level"]),
         "--batch-size", "1",
     ]
-    if ABLATION in ("B", "C", "D", "D-Strong", "D-Strong+Bit-Alloc"):
+    if ABLATION in ("B", "C", "D", "D-soft", "D-grouping",
+                    "D-Strong", "D-Strong+Bit-Alloc"):
         argv += [
             "--train-mask", str(masks), "--eval-mask", str(masks),
             "--train-edge", str(edges), "--eval-edge", str(edges),
             "--alpha-sem", "1.0", "--alpha-edge", "0.5",
-            "--gate-mode", "mask" if ABLATION in ("D", "D-Strong", "D-Strong+Bit-Alloc") else "none",
+            "--gate-mode",
+            "mask" if ABLATION in ("D", "D-grouping",
+                                   "D-Strong", "D-Strong+Bit-Alloc")
+            else "none",
         ]
-    if ABLATION in ("C", "D", "D-Strong", "D-Strong+Bit-Alloc"):
+    if ABLATION in ("C", "D", "D-soft", "D-grouping",
+                    "D-Strong", "D-Strong+Bit-Alloc"):
         argv += [
             "--use-conditioning",
             "--conditioning-mode", "spatial",
             "--conditioning-init", "zero",
         ]
-    if ABLATION == "D":
+    if ABLATION in ("D", "D-soft"):
         argv += ["--phase-schedule", "0,1,1,1,2,2,3,3,3,3"]
+    if ABLATION == "D-grouping":
+        argv += ["--phase-schedule", "0,3,3,3,2,2,1,1,1,1"]
     if ABLATION in ("D-Strong", "D-Strong+Bit-Alloc"):
         argv += [
             "--phase-schedule", "0,1,1,1,1,2,2,3,3,3",
@@ -164,7 +190,8 @@ def build_args(level, frames, mv, masks, edges):
 def resolve_args(level, frames, mv, masks, edges):
     config_path = run_config_path(level)
     if not config_path.exists():
-        if (ABLATION in ("D-Strong", "D-Strong+Bit-Alloc")
+        if (ABLATION in ("D-soft", "D-grouping",
+                         "D-Strong", "D-Strong+Bit-Alloc")
                 and experiment_dir(level).is_dir()):
             raise RuntimeError(
                 f"missing {config_path}; a {ABLATION} model directory must "
@@ -384,8 +411,8 @@ def main():
         datasets[level] = dataset
         for index, path in enumerate(dataset.imgs):
             items.append((frame_index(path), level, index))
-        print(f"Hierarchy {level}: {len(dataset)} frames, "
-              f"checkpoint {iteration}")
+        print(f"Hierarchy {level}: run {resolve_run_tag(level, ABLATION)}, "
+              f"{len(dataset)} frames, checkpoint {iteration}")
 
     if not items:
         raise SystemExit("No hierarchy level has a usable checkpoint.")
